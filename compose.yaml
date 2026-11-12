@@ -1,0 +1,59 @@
+# ndfc-mcp with its own VPN.
+#
+#   vpn        OpenConnect (Cisco AnyConnect-compatible). It owns the network
+#              namespace and the tunnel; it is the only container with extra
+#              privileges (NET_ADMIN + /dev/net/tun), and they stay inside it.
+#   ndfc-mcp   the MCP server, in the vpn container's network namespace, so the
+#              controller is reachable from it. Read-only, no capabilities.
+#
+# The tunnel lives inside the containers only: the host's routes, DNS and any
+# VPN the host itself runs are untouched.
+#
+# Every ${VARIABLE} comes from .env beside this file (copy .env.example).
+# No VPN needed, because this machine already reaches the controller?
+# Use compose.direct.yaml instead.
+name: ndfc-mcp
+
+services:
+  vpn:
+    build: ./vpn
+    image: ndfc-mcp-vpn:local
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      VPN_SERVER: ${VPN_SERVER:?set VPN_SERVER in .env (host or host:port of the VPN gateway)}
+      VPN_USERNAME: ${VPN_USERNAME:?set VPN_USERNAME in .env}
+      VPN_PASSWORD: ${VPN_PASSWORD:?set VPN_PASSWORD in .env}
+      VPN_PROTOCOL: ${VPN_PROTOCOL:-anyconnect}
+      VPN_AUTHGROUP: ${VPN_AUTHGROUP:-}
+      VPN_SERVERCERT: ${VPN_SERVERCERT:-}
+      VPN_EXTRA_ARGS: ${VPN_EXTRA_ARGS:-}
+      VPN_HEALTH_URL: ${VPN_HEALTH_URL:-}
+    # The MCP server's port is published HERE, because ndfc-mcp has no network
+    # of its own. 127.0.0.1 only: nothing off this machine can reach it.
+    ports:
+      - "127.0.0.1:${NDFC_MCP_HOST_PORT:-3300}:3300"
+    restart: unless-stopped
+
+  ndfc-mcp:
+    build: ./server
+    image: ndfc-mcp:local
+    network_mode: "service:vpn"
+    depends_on:
+      vpn:
+        condition: service_healthy
+    environment:
+      NDFC_MCP_API_KEY: ${NDFC_MCP_API_KEY:?set NDFC_MCP_API_KEY in .env (openssl rand -hex 24)}
+      NDFC_URL: ${NDFC_URL:?set NDFC_URL in .env (the controller, e.g. https://10.10.20.60)}
+      NDFC_USERNAME: ${NDFC_USERNAME:?set NDFC_USERNAME in .env}
+      NDFC_PASSWORD: ${NDFC_PASSWORD:?set NDFC_PASSWORD in .env}
+      NDFC_LOGIN_DOMAIN: ${NDFC_LOGIN_DOMAIN:-DefaultAuth}
+      NDFC_TLS_CA_PEM: ${NDFC_TLS_CA_PEM:-}
+      NDFC_TLS_INSECURE: ${NDFC_TLS_INSECURE:-}
+      NDFC_MCP_MODE: ${NDFC_MCP_MODE:-local}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped

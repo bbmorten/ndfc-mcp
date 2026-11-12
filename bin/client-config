@@ -1,0 +1,62 @@
+#!/bin/sh
+# Print ready-to-paste client configuration for THIS checkout: the real path of
+# the compose file and of docker, never the API key.
+#
+#   bin/client-config            for compose.yaml (with the VPN sidecar)
+#   bin/client-config direct     for compose.direct.yaml
+set -eu
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+FILE="$HERE/compose.yaml"
+[ "${1:-}" = "direct" ] && FILE="$HERE/compose.direct.yaml"
+DOCKER="$(command -v docker || echo docker)"
+PORT="$(grep -E '^NDFC_MCP_HOST_PORT=' "$HERE/.env" 2>/dev/null | cut -d= -f2- || true)"
+PORT="${PORT:-3300}"
+
+cat <<EOF
+────────────────────────────────────────────────────────────────────────
+Claude Code — over stdio (no key on the client)
+────────────────────────────────────────────────────────────────────────
+claude mcp add --transport stdio ndfc -- "$DOCKER" compose -f "$FILE" exec -T ndfc-mcp node /app/stdio.mjs
+
+────────────────────────────────────────────────────────────────────────
+Claude Code — over HTTP (run from this directory; the key is read from .env)
+────────────────────────────────────────────────────────────────────────
+claude mcp add --transport http ndfc http://127.0.0.1:$PORT/mcp \\
+  --header "X-Api-Key: \$(grep -E '^NDFC_MCP_API_KEY=' "$HERE/.env" | cut -d= -f2-)"
+
+────────────────────────────────────────────────────────────────────────
+Claude Desktop — add under "mcpServers" in claude_desktop_config.json
+────────────────────────────────────────────────────────────────────────
+"ndfc": {
+  "command": "$DOCKER",
+  "args": ["compose", "-f", "$FILE", "exec", "-T", "ndfc-mcp", "node", "/app/stdio.mjs"]
+}
+
+────────────────────────────────────────────────────────────────────────
+aimo for VS Code — settings.json, over stdio (read-only tools run without asking)
+────────────────────────────────────────────────────────────────────────
+"aimo.mcp.local.enabled": true,
+"aimo.mcp.local.servers": {
+  "ndfc": {
+    "type": "stdio",
+    "command": "docker",
+    "args": ["compose", "-f", "$FILE", "exec", "-T", "ndfc-mcp", "node", "/app/stdio.mjs"],
+    "description": "Read-only Cisco NDFC: fabrics, switches, interfaces, links, policies, alarms"
+  }
+}
+
+────────────────────────────────────────────────────────────────────────
+aimo for VS Code — settings.json, over HTTP (then store the key, see below)
+────────────────────────────────────────────────────────────────────────
+"aimo.mcp.local.enabled": true,
+"aimo.mcp.local.servers": {
+  "ndfc": {
+    "type": "http",
+    "url": "http://127.0.0.1:$PORT/mcp",
+    "headers": { "X-Api-Key": "\${secret:ndfc-api-key}" },
+    "description": "Read-only Cisco NDFC: fabrics, switches, interfaces, links, policies, alarms"
+  }
+}
+  Then: Command Palette → "AIMO: Set Local Server Secret" → id  ndfc-api-key
+  → paste the value of NDFC_MCP_API_KEY from $HERE/.env
+EOF

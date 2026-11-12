@@ -1,0 +1,12 @@
+# Credentials: the controller login, the VPN login and the server's API key.
+.env
+.env.*
+!.env.example
+*.pem
+
+# Local client configuration that may carry the API key.
+.mcp.json
+
+node_modules/
+.DS_Store
+*.log

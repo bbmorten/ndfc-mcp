@@ -1,0 +1,29 @@
+# ndfc-mcp WITHOUT the VPN sidecar — for a machine that already reaches the
+# controller (it is on the management network, or the host runs the VPN).
+#
+#   docker compose -f compose.direct.yaml up -d --build
+#
+# Same server, same .env (the VPN_* lines are ignored), same port.
+name: ndfc-mcp
+
+services:
+  ndfc-mcp:
+    build: ./server
+    image: ndfc-mcp:local
+    environment:
+      NDFC_MCP_API_KEY: ${NDFC_MCP_API_KEY:?set NDFC_MCP_API_KEY in .env (openssl rand -hex 24)}
+      NDFC_URL: ${NDFC_URL:?set NDFC_URL in .env (the controller, e.g. https://10.10.20.60)}
+      NDFC_USERNAME: ${NDFC_USERNAME:?set NDFC_USERNAME in .env}
+      NDFC_PASSWORD: ${NDFC_PASSWORD:?set NDFC_PASSWORD in .env}
+      NDFC_LOGIN_DOMAIN: ${NDFC_LOGIN_DOMAIN:-DefaultAuth}
+      NDFC_TLS_CA_PEM: ${NDFC_TLS_CA_PEM:-}
+      NDFC_TLS_INSECURE: ${NDFC_TLS_INSECURE:-}
+      NDFC_MCP_MODE: ${NDFC_MCP_MODE:-local}
+    # 127.0.0.1 only: nothing off this machine can reach it.
+    ports:
+      - "127.0.0.1:${NDFC_MCP_HOST_PORT:-3300}:3300"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
