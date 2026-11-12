@@ -196,6 +196,10 @@ people's own tool servers off — a call then answers that own tool servers are 
 - *"Which alarms are raised right now, grouped by switch?"*
 - *"What was the last thing deployed to spine1, and did it succeed?"*
 
+[PROMPTS.md](PROMPTS.md) has thirteen longer ones that combine several tools — rebuilding the
+topology as a diagram, triaging alarms, investigating out-of-sync switches, auditing the underlay
+addressing — with what the first four found on the sandbox.
+
 ## What it will and will not tell you
 
 - **Read-only.** No tool creates, changes, deploys or deletes anything.
