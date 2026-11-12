@@ -27,7 +27,10 @@
  *   NDFC_MCP_RESULT_BUDGET_BYTES (26000), NDFC_MCP_MODE (local | gateway) and,
  *   for gateway mode, NDFC_MCP_SLUG plus one assertion verifier (auth.mjs).
  */
+import fs from "node:fs";
 import http from "node:http";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { AuthError, apiKeyOk, createAssertionVerifier, loadAuthConfig, presentedApiKey } from "./auth.mjs";
 import { createNdfcClient, loadNdfcConfig } from "./ndfc.mjs";
@@ -251,7 +254,17 @@ export function createServer(config, deps = {}) {
   return server;
 }
 
-const isMain = process.argv[1] && import.meta.url.endsWith(process.argv[1].split("/").pop());
+// Compared as real file paths, so `node server\server.mjs` on Windows counts as
+// well as `node /app/server.mjs` in the container (and a symlinked checkout).
+const samePath = (a, b) => (process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b);
+const realPath = (p) => {
+  try {
+    return fs.realpathSync.native(p);
+  } catch {
+    return path.resolve(p);
+  }
+};
+const isMain = Boolean(process.argv[1]) && samePath(realPath(process.argv[1]), realPath(fileURLToPath(import.meta.url)));
 if (isMain) {
   const { config, missing } = loadConfig();
   if (missing.length) {

@@ -655,6 +655,9 @@ try {
   check("a refused request becomes a JSON-RPC error carrying the request id", badKey.messages.length === 1 && badKey.messages[0].id === 9 && /HTTP 401/.test(badKey.messages[0].error?.message || ""));
   const down = await runStdio([{ jsonrpc: "2.0", id: 5, method: "ping" }], { NDFC_MCP_API_KEY: API_KEY, NDFC_MCP_PORT: "9" });
   check("with the server down it answers an error for the request instead of hanging", down.messages.length === 1 && down.messages[0].id === 5 && /not answering/.test(down.messages[0].error?.message || ""));
+  // Windows PowerShell 5.1 pipes text to a program with a UTF-8 byte-order mark in front and CRLF behind.
+  const bom = await runStdio([`﻿${JSON.stringify({ jsonrpc: "2.0", id: 7, method: "ping" })}\r`], { NDFC_MCP_API_KEY: API_KEY });
+  check("a line piped in by Windows PowerShell (byte-order mark, CRLF) is answered, not a parse error", bom.code === 0 && bom.messages.length === 1 && bom.messages[0].id === 7 && bom.messages[0].error === undefined, JSON.stringify(bom.messages).slice(0, 200));
 
   // ───────────────────────── nothing secret leaves ─────────────────────────
   section("nothing secret leaves");

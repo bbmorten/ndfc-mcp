@@ -74,6 +74,9 @@ async function relay(line) {
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 rl.on("line", (line) => {
+  // Windows PowerShell puts a byte-order mark before text piped in by hand.
+  // No client sends one; without this, that first message is a parse error.
+  if (line.charCodeAt(0) === 0xfeff) line = line.slice(1);
   if (!line.trim()) return;
   pending += 1;
   relay(line).finally(() => {

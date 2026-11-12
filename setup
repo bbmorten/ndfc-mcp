@@ -14,6 +14,8 @@
  * entry in it is touched. Secrets are typed hidden and never printed.
  *
  * CommonJS and no dependencies, so it runs on any Node >= 18 without a build.
+ * On Windows a shebang starts nothing: setup.cmd beside this file runs it, so
+ * the command there is .\setup (PowerShell or cmd).
  */
 "use strict";
 
@@ -27,11 +29,14 @@ const { spawnSync } = require("node:child_process");
 const HERE = __dirname;
 const ARGS = new Set(process.argv.slice(2));
 const YES = ARGS.has("--yes") || ARGS.has("-y");
+const WINDOWS = process.platform === "win32";
+const SELF = WINDOWS ? ".\\setup" : "./setup"; // how this script is started, for the messages
 const SERVER = "ndfc";
 const DESCRIPTION = "Read-only Cisco NDFC: fabrics, switches, interfaces, links, policies, alarms";
 
 if (ARGS.has("--help") || ARGS.has("-h")) {
-  console.log(fs.readFileSync(__filename, "utf8").split("\n").slice(2, 16).map((l) => l.replace(/^ \*\/?\s?/, "")).join("\n"));
+  const help = fs.readFileSync(__filename, "utf8").split(/\r?\n/).slice(2, 16).map((l) => l.replace(/^ \*\/?\s?/, "")).join("\n");
+  console.log(help.replaceAll("./setup", SELF));
   process.exit(0);
 }
 if (Number.parseInt(process.versions.node, 10) < 18) {
@@ -123,7 +128,7 @@ function prompt(text, secret = false) {
 async function ask(label, def, { secret = false, validate = () => null, hint = "" } = {}) {
   if (YES) {
     const problem = def ? validate(def) : "no default to take";
-    if (problem) throw new Error(`${label}: ${problem} (run ./setup without --yes)`);
+    if (problem) throw new Error(`${label}: ${problem} (run ${SELF} without --yes)`);
     return def;
   }
   const shown = def ? (secret ? dim(" [saved — Enter keeps it]") : dim(` [${def}]`)) : "";
@@ -268,7 +273,7 @@ function writeWithBackup(file, content, mode) {
 const tilde = (p) => (p.startsWith(os.homedir()) ? `~${p.slice(os.homedir().length)}` : p);
 
 function findExe(name) {
-  const exts = process.platform === "win32" ? (process.env.PATHEXT || ".EXE;.CMD;.BAT").split(";") : [""];
+  const exts = WINDOWS ? (process.env.PATHEXT || ".EXE;.CMD;.BAT").split(";") : [""];
   for (const dir of (process.env.PATH || "").split(path.delimiter)) {
     for (const ext of exts) {
       const p = path.join(dir, name + ext);
@@ -404,6 +409,8 @@ function scanTopLevel(text) {
 /** Set top-level keys in JSONC text, keeping every other line (comments included) as it was. */
 function setJsoncKeys(text, entries) {
   if (!text.trim()) text = "{\n}\n";
+  // New lines end the way the file's own do (settings.json on Windows is CRLF).
+  const eol = text.includes("\r\n") ? "\r\n" : "\n";
   for (const [key, val] of entries) {
     const { open, close, members } = scanTopLevel(text);
     const first = members[0];
@@ -413,15 +420,15 @@ function setJsoncKeys(text, entries) {
       const lead = text.slice(lineStart, first.keyStart);
       if (/^[ \t]*$/.test(lead) && lead) indent = lead;
     }
-    const rendered = JSON.stringify(val, null, indent).replace(/\n/g, `\n${indent}`);
+    const rendered = JSON.stringify(val, null, indent).replace(/\n/g, `${eol}${indent}`);
     const hit = members.find((m) => m.key === key);
     if (hit) {
       text = text.slice(0, hit.valueStart) + rendered + text.slice(hit.valueEnd);
     } else if (members.length) {
       const last = members[members.length - 1];
-      text = `${text.slice(0, last.valueEnd)},\n${indent}${JSON.stringify(key)}: ${rendered}${text.slice(last.valueEnd)}`;
+      text = `${text.slice(0, last.valueEnd)},${eol}${indent}${JSON.stringify(key)}: ${rendered}${text.slice(last.valueEnd)}`;
     } else {
-      text = `${text.slice(0, open + 1)}\n${indent}${JSON.stringify(key)}: ${rendered}\n${text.slice(close)}`;
+      text = `${text.slice(0, open + 1)}${eol}${indent}${JSON.stringify(key)}: ${rendered}${eol}${text.slice(close)}`;
     }
   }
   return text;
@@ -472,6 +479,37 @@ async function callTool(port, key, name) {
   if (body.error) return { error: body.error.message };
   const text = body.result?.content?.[0]?.text || "";
   return body.result?.isError ? { error: text } : { value: JSON.parse(text) };
+}
+
+// ── The claude CLI ──────────────────────────────────────────────────────────
+
+/**
+ * Register (or remove) the server through the claude CLI.
+ *
+ * claude as a real executable (macOS, Linux, the Windows native install) is
+ * started directly and given the entry as JSON. An npm install on Windows is
+ * claude.cmd, which Node starts only through cmd.exe, and a JSON argument does
+ * not survive cmd.exe's quoting. There the same entry goes in as plain
+ * arguments (claude mcp add), each one checked before it is quoted.
+ */
+function claudeMcp(claude, action, scope, entry) {
+  const opts = { cwd: HERE, encoding: "utf8" };
+  const viaCmd = WINDOWS && /\.(cmd|bat)$/i.test(claude);
+  let args;
+  if (action === "remove") args = ["mcp", "remove", SERVER, "-s", scope];
+  else if (!viaCmd) args = ["mcp", "add-json", SERVER, JSON.stringify(entry), "-s", scope];
+  else if (entry.type === "http") {
+    args = ["mcp", "add", "--transport", "http", "-s", scope, SERVER, entry.url];
+    for (const [name, value] of Object.entries(entry.headers || {})) args.push("--header", `${name}: ${value}`);
+  } else args = ["mcp", "add", "--transport", "stdio", "-s", scope, SERVER, "--", entry.command, ...entry.args];
+  if (!viaCmd) return spawnSync(claude, args, opts);
+  const quoted = [];
+  for (const a of [claude, ...args]) {
+    // Inside "double quotes" cmd.exe takes everything literally but these two.
+    if (/["%]/.test(a)) return { status: 1, stdout: "", stderr: `an argument holds a " or % character, which cmd.exe cannot pass to ${path.basename(claude)}` };
+    quoted.push(/^[A-Za-z0-9_.:\/\\-]+$/.test(a) ? a : `"${a.replace(/(\\+)$/, "$1$1")}"`);
+  }
+  return spawnSync(quoted.join(" "), { ...opts, shell: true });
 }
 
 // ── Client configuration ────────────────────────────────────────────────────
@@ -665,11 +703,24 @@ async function main() {
       // Start without verification once, to read the CA the controller presents.
       fs.writeFileSync(envFile, renderEnv({ ...v, NDFC_TLS_INSECURE: "true" }), { mode: 0o600 });
     }
-    if (!up()) bad("docker compose up failed (output above)");
-    else if (!(await waitHealthy(docker, composeFile, services, mode === "vpn" ? 240 : 90))) {
+    if (!up()) {
+      bad("docker compose up failed (output above)");
+      // Say which of the two usual reasons it is: no daemon, or (with the sidecar)
+      // a tunnel that never came up, which fails `up` on the health dependency.
+      const rows = composeStatus(docker, composeFile);
+      if (rows === null) warn(`Docker is installed but not answering: start Docker Desktop (or the Docker service), then run ${SELF} again`);
+      else if (mode === "vpn" && rows.some((r) => r.service === "vpn" && r.health !== "healthy")) {
+        console.log("  The vpn container's last log lines:");
+        compose(docker, composeFile, ["logs", "--no-log-prefix", "--tail", "12", "vpn"], { stdio: "inherit" });
+        warn(`the tunnel did not come up. "Login failed" means the gateway refused the VPN login — a DevNet reservation that ended takes its login with it: run ${SELF} again with the new one`);
+        // Left running, the sidecar retries that login every few seconds.
+        compose(docker, composeFile, ["stop", "vpn"], { stdio: "ignore" });
+        warn("the vpn container was stopped, so it does not keep retrying a refused login");
+      }
+    } else if (!(await waitHealthy(docker, composeFile, services, mode === "vpn" ? 240 : 90))) {
       bad("the containers did not become healthy. Their last log lines:");
       compose(docker, composeFile, ["logs", "--tail", "25"], { stdio: "inherit" });
-      if (mode === "vpn") warn("a VPN that will not connect usually means a stale reservation login: run ./setup again with the new one");
+      if (mode === "vpn") warn(`a VPN that will not connect usually means a stale reservation login: run ${SELF} again with the new one`);
     } else {
       running = true;
       ok("containers healthy");
@@ -686,7 +737,7 @@ async function main() {
         } else {
           v.NDFC_TLS_INSECURE = "true";
           fs.writeFileSync(envFile, renderEnv(v), { mode: 0o600 });
-          warn("not pinned: the certificate is NOT verified (NDFC_TLS_INSECURE=true). Run ./setup again to pin it");
+          warn(`not pinned: the certificate is NOT verified (NDFC_TLS_INSECURE=true). Run ${SELF} again to pin it`);
         }
       }
       if (running) {
@@ -724,13 +775,13 @@ async function main() {
         bad(`Claude Code: .mcp.json is not valid JSON (${e.message}); left as it was`);
       }
     } else {
-      spawnSync(claude, ["mcp", "remove", SERVER, "-s", scope], { cwd: HERE, encoding: "utf8" });
-      const r = spawnSync(claude, ["mcp", "add-json", SERVER, JSON.stringify(entry), "-s", scope], { cwd: HERE, encoding: "utf8" });
+      claudeMcp(claude, "remove", scope);
+      const r = claudeMcp(claude, "add", scope, entry);
       wrote = true;
       if (r.status === 0) {
         ok(`Claude Code: "${SERVER}" added, ${scope} scope`);
         next.push("Claude Code: start a new session (or /mcp) to connect");
-      } else bad(`Claude Code: claude mcp add-json failed: ${(r.stderr || r.stdout || "").trim().split("\n")[0]}`);
+      } else bad(`Claude Code: the claude CLI could not add it:${(r.stderr || r.stdout || "").trim().split("\n")[0]}`);
     }
   }
 
@@ -790,7 +841,7 @@ async function main() {
   section("Done");
   for (const s of next) console.log(`  → ${s}`);
   console.log(`  → try: "Which fabrics does the controller manage, and are their switches in sync?"`);
-  console.log(dim(`  Run ./setup again any time; it starts from what it wrote.`));
+  console.log(dim(`  Run ${SELF} again any time; it starts from what it wrote.`));
 }
 
 main()

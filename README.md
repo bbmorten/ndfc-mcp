@@ -32,7 +32,8 @@ gives the serial numbers).
 
 ## What you need
 
-- **Docker** with Compose v2 (Docker Desktop on macOS/Windows, Docker Engine on Linux).
+- **Docker** with Compose v2 (Docker Desktop on macOS/Windows, Docker Engine on Linux). On
+  Windows, see [On Windows](#on-windows) for the commands.
 - **A controller** — Nexus Dashboard with the Fabric Controller service — and an account on it.
   A read-only account (role `network-operator`) is all the server needs.
 - **The VPN details** for the controller's network, as you would type them into Cisco
@@ -111,6 +112,45 @@ docker compose -f compose.direct.yaml up -d --build
 
 Same server, same `.env` (the `VPN_*` lines are ignored), same port. Use
 `-f compose.direct.yaml` in every `docker compose` command below, and `bin/client-config direct`.
+
+### On Windows
+
+Everything above works on Windows with **Docker Desktop** (Linux containers, the WSL 2 backend)
+and **Node 18 or newer**. The containers are the same Linux images; only the commands you type
+differ. In PowerShell or cmd:
+
+```powershell
+cd ndfc-mcp
+.\setup                 # or: .\setup --yes
+bin\client-config       # or: bin\client-config direct
+```
+
+`setup.cmd` and `bin\client-config.cmd` start the same two Node scripts that macOS and Linux
+start through their shebang. Type the leading `.\` for `setup`. In Git Bash, `./setup` and
+`bin/client-config` work as they do on macOS.
+
+`bin\client-config` prints Windows paths, and its two `claude mcp add` lines are written for
+PowerShell. Copy them from there instead of from this page: the examples under
+[Connect a client](#connect-a-client) are for a POSIX shell.
+
+The manual way, in PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"   # a value for NDFC_MCP_API_KEY
+docker compose up -d --build
+curl.exe -s http://127.0.0.1:3300/healthz
+'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_controller_info","arguments":{}}}' | docker compose exec -T ndfc-mcp node /app/stdio.mjs
+```
+
+Write `curl.exe`: in Windows PowerShell, plain `curl` is a different command.
+
+Clone with Git and the line endings take care of themselves (`.gitattributes` keeps the shell
+scripts LF). A ZIP download or a clone older than that file has CRLF scripts; the `vpn` image
+strips them when it is built, so `docker compose up -d --build` is enough.
+
+Windows has no `chmod 600`: `.env` is protected by the permissions of your user folder, so keep
+the checkout inside it.
 
 ## Connect a client
 
@@ -264,7 +304,8 @@ docker compose down                   # stop; the tunnel closes with it
 | You see | It means | Do |
 | --- | --- | --- |
 | `set VPN_SERVER in .env …` when starting | A required setting is empty | Fill it in `.env` |
-| `vpn` stays `starting` / `unhealthy` | The tunnel did not come up | `docker compose logs vpn`: wrong gateway, login, group, or a certificate to pin (`VPN_SERVERCERT`) |
+| `failed to connect to the docker API at npipe:////./pipe/docker_engine` (Windows) | Docker Desktop is installed but not running | Start Docker Desktop, wait for it to say it is running, run the command again |
+| `vpn` stays `starting` / `unhealthy`, or `dependency failed to start: container ndfc-mcp-vpn-1 is unhealthy` | The tunnel did not come up | `docker compose logs vpn`: wrong gateway, login, group, or a certificate to pin (`VPN_SERVERCERT`). `Login failed.` is the gateway refusing the VPN login: a DevNet reservation that ended takes its login with it, so run `setup` again with the new one |
 | `ndfc-mcp` never starts | It waits for `vpn` to be healthy | Fix the VPN first |
 | Tool error `upstream_unreachable` / `upstream_timeout` | The server cannot reach `NDFC_URL` | VPN up? Right address? `docker compose exec vpn curl -sk https://<controller>/version.json` |
 | Tool error `upstream_tls` | The controller's certificate was not accepted | See [The controller's certificate](#the-controllers-certificate) |
@@ -277,7 +318,7 @@ docker compose down                   # stop; the tunnel closes with it
 ## Tests
 
 ```bash
-node test/verify-local.mjs    # 174 checks against a stub controller; no network, no credentials
+node test/verify-local.mjs    # 175 checks against a stub controller; no network, no credentials
 node test/live-check.mjs      # every tool against the real controller in .env (run where node can reach it)
 ```
 
@@ -292,6 +333,12 @@ capabilities, the CA pin, and the VPN sidecar — it logged in to the sandbox's 
 HTTP and stdio. **Not yet verified:** Claude Desktop and the aimo extension (the configuration
 follows each client's documented format), and a gateway other than the sandbox's. `list_vrfs` and
 `list_networks` have only seen empty lists, because the sandbox fabric defines none.
+
+On Windows 11 with Docker Desktop (same day): the 175 checks pass, and `.\setup` built and
+started the server without the sidecar, saw it healthy, and reached it over HTTP and over stdio
+through `docker compose exec`. With the sidecar, the `vpn` container reached the sandbox gateway,
+which refused the login of a reservation that had ended. So **a tunnel that comes up, and a real
+controller behind it, have not been seen from Windows.**
 
 `spec/` holds Cisco's OpenAPI document for NDFC 12.2.2 (Apache 2.0), which the tests hold the
 tools to.

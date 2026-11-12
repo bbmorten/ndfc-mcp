@@ -24,7 +24,8 @@ VPN the server has to open itself — which a cluster deployment could not do.
 | `server/pin-ca.mjs` | prints `NDFC_TLS_CA_PEM` for the controller's CA |
 | `vpn/` | the OpenConnect sidecar: `connect.sh` (connect, retry), `healthcheck.sh` (tun0 has an address) |
 | `compose.yaml` / `compose.direct.yaml` | with the VPN sidecar / without it |
-| `bin/client-config` | prints client configuration with this checkout's real paths, never the key |
+| `bin/client-config` | prints client configuration with this checkout's real paths, never the key. Node (CommonJS, no dependencies) since the Windows work; on POSIX its output is byte-identical to the `sh` script it replaced, on Windows the two `claude` lines are PowerShell |
+| `setup.cmd`, `bin/client-config.cmd` | Windows launchers: `node` on the script beside them. CRLF (`.gitattributes`); everything else is LF |
 | `setup` | the interactive installer (Node, CommonJS, no dependencies): asks, writes `.env`, starts and checks the containers, configures Claude Code / Claude Desktop / aimo. Touches only the `ndfc` entry of a client file, backs it up first, keeps JSONC comments in VS Code's `settings.json`, never prints a secret |
 | `defaults.env` | `setup`'s defaults — **committed with the lab's credentials, on the owner's decision** (see Working rules) |
 | `test/verify-local.mjs` | the offline harness (stub controller on loopback) |
@@ -34,8 +35,8 @@ VPN the server has to open itself — which a cluster deployment could not do.
 ## Commands
 
 ```bash
-./setup                                    # after a clone: asks, writes .env, starts, configures clients
-node test/verify-local.mjs                 # 174 checks, no network — run after EVERY change
+./setup                                    # after a clone: asks, writes .env, starts, configures clients (Windows: .\setup)
+node test/verify-local.mjs                 # 175 checks, no network — run after EVERY change
 node test/live-check.mjs                   # needs .env and a controller node can reach from the host
 docker compose up -d --build               # with the VPN sidecar
 docker compose -f compose.direct.yaml up -d --build   # controller already reachable
@@ -80,6 +81,12 @@ There is no linter and no package.json. The harness is the gate.
 - **The VPN password is never on a command line or in a log** (`connect.sh` pipes it from a
   shell builtin), and only the `vpn` container holds `NET_ADMIN`.
 - **stdout of `stdio.mjs` carries protocol messages only.**
+- **macOS and Windows hosts both work, from one set of scripts.** Whatever runs on the host is
+  Node, never `sh` (`vpn/*.sh` run inside the image). A host path is built with `node:path` and
+  goes into JSON through `JSON.stringify`. `setup` starts `claude.cmd` (an npm install on
+  Windows) through cmd.exe with plain arguments, because a JSON argument does not survive its
+  quoting; a real executable still gets `add-json`. A change to `setup` or `bin/client-config`
+  is checked on both: on POSIX the output must not move.
 
 ## Working rules
 
@@ -117,10 +124,47 @@ the containers healthy without recreating them, answered `get_controller_info`, 
 bridge answered. It *wrote* the Claude Desktop and aimo configurations, but neither client was
 run against them.
 
-**Not verified:** a gateway other than the sandbox's (a second factor, a private gateway
-certificate, another protocol); Claude Desktop; the aimo VS Code extension (the configuration follows
-its documented `aimo.mcp.local.servers` format, and the server speaks the protocol revision it
-uses, 2025-06-18). `list_vrfs` / `list_networks` have only seen empty lists.
+Windows is partly verified (same day; Windows 11, Node 22.15, Git Bash and PowerShell 5.1, no
+controller in reach; first with Podman 5.5, then with Docker Desktop 29.9 / Compose 5.7 — see
+the paragraph after this one). The harness, now 175 checks, passes; it
+found that `server.mjs` never started when run directly on Windows (its "am I the main module"
+test split the path on `/`). `.\setup` ran in simulated fresh clones with `%APPDATA%` redirected
+and a fake npm-style `claude.cmd`: `--yes` reproduced `.env` and `.mcp.json`; piped answers
+covered Claude Code at user scope over stdio and HTTP through `claude.cmd`, Claude Desktop under
+`%APPDATA%\Claude`, and aimo in a CRLF `settings.json` with comments, which keeps its CRLF. No
+secret was printed. Both images were built from the Windows checkout and run by hand with the
+settings `compose.direct.yaml` declares: `/healthz`, 401 without the key, twelve tools with it,
+and the stdio bridge driven from Node and from a PowerShell pipe (which prepends a byte-order
+mark; the bridge now drops it). The `vpn` image ran its connect loop against a dead loopback
+port; built from CRLF copies of its scripts it died at exec with the previous Dockerfile and ran
+with this one. For macOS, the committed and the new `setup` and `bin/client-config` were run
+side by side in a Linux container: identical output and files, but for the second in a backup's
+name.
+
+With Docker Desktop on the same machine: `.\setup` in direct mode, in a fresh-clone copy under
+its own project name and port, built the image, waited for `healthy`, got 200 from `/healthz`,
+reported `upstream_unreachable` for the controller, and the stdio bridge answered through
+`docker compose exec`; the Claude Desktop entry it wrote (full path of `docker.exe`), run as
+written, listed the tools; the port was published on 127.0.0.1 only. `compose.yaml` built and
+started the sidecar, which reached the sandbox gateway and chose group `SSLClient`, and the
+gateway answered **"Login failed"** to the login in `defaults.env` — the settings were in the
+container byte for byte, so that is the gateway's answer, most likely a reservation that had
+ended. No tunnel came up on Windows. That run is why `setup` now says, when `up` fails,
+whether Docker is not answering or the tunnel did not come up, shows the sidecar's last lines,
+and stops it instead of leaving it to retry a refused login.
+
+**Not verified:** on Windows, a tunnel that comes up (and so a real controller, and `setup`'s
+CA pin), and a real `claude` CLI; macOS itself after
+the Windows change (Linux stood in for it); a gateway other than the sandbox's (a second
+factor, a private gateway certificate, another protocol); Claude Desktop; the aimo VS Code
+extension (the configuration follows its documented `aimo.mcp.local.servers` format, and the
+server speaks the protocol revision it uses, 2025-06-18). `list_vrfs` / `list_networks` have
+only seen empty lists.
+
+Seen under Podman and left alone: with the controller unreachable and `NDFC_TIMEOUT_MS=4000`,
+`get_controller_info` took 134 s and then 34 s to answer `upstream_unreachable`, though a bare
+request from the same container timed out on schedule. Under Docker Desktop the same answer
+came within `setup`'s 30 s run, so it may be Podman's network; not looked into.
 
 ## The lab
 

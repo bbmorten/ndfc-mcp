@@ -6,4 +6,7 @@
 setup text eol=lf
 bin/client-config text eol=lf
 
+# The Windows launchers are the one exception: cmd.exe wants CRLF.
+*.cmd text eol=crlf
+
 *.gz binary
