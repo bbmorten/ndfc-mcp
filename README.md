@@ -259,9 +259,10 @@ Both need only Node.js 20 or later; the server has no npm dependencies.
 
 Version 0.2.0. Verified on 2026-11-12 against the DevNet sandbox (NDFC 12.2.2 on Nexus Dashboard
 3.2): all twelve tools, both transports with Claude Code, the image run read-only without
-capabilities, and the CA pin. **Not yet verified:** the VPN sidecar against a real gateway (its
-refusals and retry loop are tested; an actual AnyConnect login is not), Claude Desktop, and the
-aimo extension — the configuration follows each client's documented format. `list_vrfs` and
+capabilities, the CA pin, and the VPN sidecar — it logged in to the sandbox's AnyConnect gateway
+(group `SSLClient`, DTLS), took the split-tunnel routes, and the server answered through it over
+HTTP and stdio. **Not yet verified:** Claude Desktop and the aimo extension (the configuration
+follows each client's documented format), and a gateway other than the sandbox's. `list_vrfs` and
 `list_networks` have only seen empty lists, because the sandbox fabric defines none.
 
 `spec/` holds Cisco's OpenAPI document for NDFC 12.2.2 (Apache 2.0), which the tests hold the

@@ -93,9 +93,16 @@ Verified against Cisco's DevNet sandbox (NDFC 12.2.2.241, Nexus Dashboard 3.2(1i
 174/174, live-check 28/28 with the CA pinned, `compose.direct.yaml` up and healthy, and the
 `claude` CLI calling tools over both HTTP and stdio.
 
-**Not verified:** the VPN sidecar against a real gateway (no VPN credentials were available to
-the session that built it — its refusals, retry loop and clean stop are tested, an actual
-AnyConnect login is not); Claude Desktop; the aimo VS Code extension (the configuration follows
+The VPN sidecar is verified too (same day, `compose.yaml`): OpenConnect logged in to the
+sandbox gateway (`devnetsandbox-usw1-reservation.cisco.com:<port of the reservation>`, group
+`SSLClient` chosen without `VPN_AUTHGROUP`, DTLS + LZS), `tun0` got `192.168.254.x/32` and
+split-tunnel routes for `10.10.20.0/24`–`10.10.24.0/24` — the container's default route stayed
+on `eth0` — and the server made one controller login and answered tool calls over HTTP, stdio
+and the `claude` CLI. That run was made while the host's own VPN client was also connected; the
+container's routes show it used its own tunnel, but a run with the host VPN off was not made.
+
+**Not verified:** a gateway other than the sandbox's (a second factor, a private gateway
+certificate, another protocol); Claude Desktop; the aimo VS Code extension (the configuration follows
 its documented `aimo.mcp.local.servers` format, and the server speaks the protocol revision it
 uses, 2025-06-18). `list_vrfs` / `list_networks` have only seen empty lists.
 
