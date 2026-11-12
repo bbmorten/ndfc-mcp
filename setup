@@ -1,0 +1,802 @@
+#!/usr/bin/env node
+/**
+ * setup — configure ndfc-mcp and the clients that use it, by asking questions.
+ *
+ *   ./setup          ask; every answer is pre-filled, Enter keeps it
+ *   ./setup --yes    take every default without asking
+ *
+ * Defaults, lowest to highest: .env.example, defaults.env (committed: the
+ * values this project runs with), .env (this checkout's own, when it exists).
+ *
+ * It writes .env, can build and start the containers and check the controller
+ * answers, and registers the server with Claude Code, Claude Desktop and aimo
+ * for VS Code. A client file it changes is backed up first, and only the ndfc
+ * entry in it is touched. Secrets are typed hidden and never printed.
+ *
+ * CommonJS and no dependencies, so it runs on any Node >= 18 without a build.
+ */
+"use strict";
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const readline = require("node:readline");
+const { spawnSync } = require("node:child_process");
+
+const HERE = __dirname;
+const ARGS = new Set(process.argv.slice(2));
+const YES = ARGS.has("--yes") || ARGS.has("-y");
+const SERVER = "ndfc";
+const DESCRIPTION = "Read-only Cisco NDFC: fabrics, switches, interfaces, links, policies, alarms";
+
+if (ARGS.has("--help") || ARGS.has("-h")) {
+  console.log(fs.readFileSync(__filename, "utf8").split("\n").slice(2, 16).map((l) => l.replace(/^ \*\/?\s?/, "")).join("\n"));
+  process.exit(0);
+}
+if (Number.parseInt(process.versions.node, 10) < 18) {
+  console.error(`setup needs Node 18 or newer (this is ${process.version}).`);
+  process.exit(1);
+}
+
+// ── Terminal ────────────────────────────────────────────────────────────────
+
+const color = process.stdout.isTTY && !process.env.NO_COLOR;
+const paint = (code) => (s) => (color ? `\x1b[${code}m${s}\x1b[0m` : String(s));
+const bold = paint(1);
+const dim = paint(2);
+const green = paint(32);
+const yellow = paint(33);
+const red = paint(31);
+const ok = (s) => console.log(`  ${green("✓")} ${s}`);
+const warn = (s) => console.log(`  ${yellow("!")} ${s}`);
+const bad = (s) => console.log(`  ${red("✗")} ${s}`);
+const section = (s) => console.log(`\n${bold(s)}`);
+
+// One readline at a time, closed while docker runs (so Ctrl+C reaches it), and
+// a queue of lines so answers piped in ahead of their questions are not lost.
+let rl = null;
+let releasing = false;
+let muted = false; // a secret is being typed: echo nothing but the prompt
+let currentPrompt = "";
+let waiter = null;
+let inputEnded = false;
+const queued = [];
+let wrote = false; // has anything been written yet? (for the stop messages)
+
+const stopped = (why) => {
+  console.log(`\n${why}. ${wrote ? "What was already written stays (backups beside each file)." : "Nothing was written."}`);
+  process.exit(why === "Stopped" ? 130 : 1);
+};
+
+function terminal() {
+  if (rl || inputEnded) return;
+  rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: Boolean(process.stdin.isTTY) });
+  const write = rl._writeToOutput.bind(rl);
+  rl._writeToOutput = (s) => {
+    if (!muted) write(s);
+    else if (s.startsWith(currentPrompt)) write(currentPrompt);
+    else if (/[\r\n]/.test(s)) write("\n");
+  };
+  rl.on("line", (line) => {
+    if (!waiter) return void queued.push(line);
+    if (!process.stdin.isTTY) process.stdout.write(`${muted ? "" : line.trim()}\n`);
+    const w = waiter;
+    waiter = null;
+    muted = false;
+    w(line.trim());
+  });
+  rl.on("SIGINT", () => stopped("Stopped"));
+  rl.on("close", () => {
+    rl = null;
+    if (releasing) return;
+    inputEnded = true;
+    if (waiter) stopped("Input ended");
+  });
+}
+
+function release() {
+  if (!rl) return;
+  releasing = true;
+  rl.close();
+  releasing = false;
+}
+
+function prompt(text, secret = false) {
+  terminal();
+  if (queued.length) {
+    const line = queued.shift().trim();
+    process.stdout.write(`${text}${secret ? "" : line}\n`);
+    return Promise.resolve(line);
+  }
+  if (inputEnded) stopped("Input ended");
+  currentPrompt = text;
+  rl.setPrompt(text);
+  rl.prompt();
+  muted = secret;
+  return new Promise((resolve) => {
+    waiter = resolve;
+  });
+}
+
+/** A free-text answer. def is offered and kept on Enter; secret hides typing and the default. */
+async function ask(label, def, { secret = false, validate = () => null, hint = "" } = {}) {
+  if (YES) {
+    const problem = def ? validate(def) : "no default to take";
+    if (problem) throw new Error(`${label}: ${problem} (run ./setup without --yes)`);
+    return def;
+  }
+  const shown = def ? (secret ? dim(" [saved — Enter keeps it]") : dim(` [${def}]`)) : "";
+  for (;;) {
+    const answer = (await prompt(`  ${label}${hint ? dim(` (${hint})`) : ""}${shown}: `, secret)) || def || "";
+    const problem = answer ? validate(answer) : "an answer is needed";
+    if (!problem) return answer;
+    bad(problem);
+  }
+}
+
+/** One of several options; returns its key. */
+async function choose(label, options, defKey) {
+  const defIndex = Math.max(0, options.findIndex((o) => o.key === defKey));
+  if (YES) return options[defIndex].key;
+  console.log(`  ${label}`);
+  options.forEach((o, i) => console.log(`    ${i + 1}) ${o.label}${o.note ? dim(` — ${o.note}`) : ""}`));
+  for (;;) {
+    const answer = await prompt(`  Choice${dim(` [${defIndex + 1}]`)}: `);
+    if (!answer) return options[defIndex].key;
+    const n = Number.parseInt(answer, 10);
+    if (String(n) === answer && n >= 1 && n <= options.length) return options[n - 1].key;
+    const byKey = options.find((o) => o.key === answer.toLowerCase());
+    if (byKey) return byKey.key;
+    bad(`answer 1–${options.length}`);
+  }
+}
+
+async function yesno(label, def) {
+  if (YES) return def;
+  for (;;) {
+    const answer = (await prompt(`  ${label} ${dim(def ? "[Y/n]" : "[y/N]")}: `)).toLowerCase();
+    if (!answer) return def;
+    if (["y", "yes", "e", "evet"].includes(answer)) return true;
+    if (["n", "no", "h", "hayır", "hayir"].includes(answer)) return false;
+    bad("answer y or n");
+  }
+}
+
+// ── .env files ──────────────────────────────────────────────────────────────
+
+/** KEY=VALUE lines the way Docker Compose reads them: 'literal', "escaped", or bare with a # comment. */
+function readEnv(file) {
+  try {
+    return parseEnv(fs.readFileSync(file, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function parseEnv(text) {
+  const values = {};
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line);
+    if (!m) continue;
+    let raw = m[2];
+    let value;
+    if (raw.startsWith("'")) {
+      const end = raw.indexOf("'", 1);
+      value = end < 0 ? raw.slice(1) : raw.slice(1, end);
+    } else if (raw.startsWith('"')) {
+      let out = "";
+      let i = 1;
+      for (; i < raw.length && raw[i] !== '"'; i++) {
+        if (raw[i] === "\\" && i + 1 < raw.length) {
+          const c = raw[++i];
+          out += c === "n" ? "\n" : c === "t" ? "\t" : c;
+        } else if (raw[i] === "$" && raw[i + 1] === "$") {
+          out += "$";
+          i++;
+        } else out += raw[i];
+      }
+      value = out;
+    } else {
+      value = raw.replace(/\s+#.*$/, "").trim();
+    }
+    values[m[1]] = value;
+  }
+  return values;
+}
+
+function quoteEnv(value) {
+  if (/^[A-Za-z0-9_.,:/@+=%-]*$/.test(value)) return value;
+  if (!value.includes("'") && !value.includes("\n")) return `'${value}'`;
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\$/g, "$$$$")}"`;
+}
+
+const ENV_LAYOUT = [
+  ["# The MCP server — the key every client sends, and the port on this machine (127.0.0.1 only).", ["NDFC_MCP_API_KEY", "NDFC_MCP_HOST_PORT", "NDFC_MCP_MODE"]],
+  ["# The controller and the account the server reads it with.", ["NDFC_URL", "NDFC_USERNAME", "NDFC_PASSWORD", "NDFC_LOGIN_DOMAIN"]],
+  ["# TLS to the controller: a pinned CA, or (a lab only) no verification.", ["NDFC_TLS_CA_PEM", "NDFC_TLS_INSECURE"]],
+  ["# The VPN sidecar (compose.yaml only; compose.direct.yaml ignores these).", ["VPN_SERVER", "VPN_USERNAME", "VPN_PASSWORD", "VPN_PROTOCOL", "VPN_AUTHGROUP", "VPN_SERVERCERT", "VPN_EXTRA_ARGS", "VPN_HEALTH_URL"]],
+  ["# Read by ./setup only: vpn (compose.yaml) or direct (compose.direct.yaml).", ["NDFC_MCP_COMPOSE"]],
+];
+
+function renderEnv(values) {
+  const lines = ["# Written by ./setup. Git-ignored; never commit it. Run ./setup again to change it.", ""];
+  const placed = new Set();
+  for (const [comment, keys] of ENV_LAYOUT) {
+    const present = keys.filter((k) => values[k] !== undefined && values[k] !== "");
+    if (!present.length) continue;
+    lines.push(comment);
+    for (const k of present) {
+      lines.push(`${k}=${quoteEnv(values[k])}`);
+      placed.add(k);
+    }
+    lines.push("");
+  }
+  const rest = Object.keys(values).filter((k) => !placed.has(k) && values[k] !== undefined && values[k] !== "");
+  if (rest.length) {
+    lines.push("# Other settings, carried over.");
+    for (const k of rest) lines.push(`${k}=${quoteEnv(values[k])}`);
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+// ── Files ───────────────────────────────────────────────────────────────────
+
+const stamp = () => new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
+
+/** Write a file; keep the previous content beside it as <name>.bak-<time> when it changes. */
+function writeWithBackup(file, content, mode) {
+  let before = null;
+  try {
+    before = fs.readFileSync(file, "utf8");
+  } catch {}
+  if (before === content) return "unchanged";
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  let backup = null;
+  if (before !== null) {
+    backup = `${file}.bak-${stamp()}`;
+    fs.copyFileSync(file, backup);
+    if (mode) fs.chmodSync(backup, mode);
+  }
+  fs.writeFileSync(file, content, mode ? { mode } : undefined);
+  if (mode) fs.chmodSync(file, mode);
+  wrote = true;
+  return backup ? `changed (previous: ${path.basename(backup)})` : "created";
+}
+
+const tilde = (p) => (p.startsWith(os.homedir()) ? `~${p.slice(os.homedir().length)}` : p);
+
+function findExe(name) {
+  const exts = process.platform === "win32" ? (process.env.PATHEXT || ".EXE;.CMD;.BAT").split(";") : [""];
+  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+    for (const ext of exts) {
+      const p = path.join(dir, name + ext);
+      try {
+        if (fs.statSync(p).isFile()) return p;
+      } catch {}
+    }
+  }
+  return null;
+}
+
+// ── JSON with comments (VS Code settings.json) ──────────────────────────────
+
+/** Strip // and /* *\/ comments and trailing commas outside strings, then parse. */
+function parseJsonc(text) {
+  let out = "";
+  for (let i = 0; i < text.length; ) {
+    const c = text[i];
+    if (c === '"') {
+      let j = i + 1;
+      while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
+      out += text.slice(i, j + 1);
+      i = j + 1;
+    } else if (text.startsWith("//", i)) {
+      const e = text.indexOf("\n", i);
+      i = e < 0 ? text.length : e;
+    } else if (text.startsWith("/*", i)) {
+      const e = text.indexOf("*/", i + 2);
+      i = e < 0 ? text.length : e + 2;
+    } else if (c === ",") {
+      let j = i + 1;
+      while (j < text.length && /\s/.test(text[j])) j++;
+      // a comment between the comma and the bracket: look past it the slow way
+      const restStripped = parseJsoncPeek(text, j);
+      if (restStripped === "}" || restStripped === "]") i++;
+      else {
+        out += c;
+        i++;
+      }
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return JSON.parse(out.trim() === "" ? "{}" : out);
+}
+
+/** The next significant character at or after i, skipping whitespace and comments. */
+function parseJsoncPeek(text, i) {
+  for (;;) {
+    while (i < text.length && /\s/.test(text[i])) i++;
+    if (text.startsWith("//", i)) {
+      const e = text.indexOf("\n", i);
+      i = e < 0 ? text.length : e + 1;
+    } else if (text.startsWith("/*", i)) {
+      const e = text.indexOf("*/", i + 2);
+      i = e < 0 ? text.length : e + 2;
+    } else return text[i];
+  }
+}
+
+/** The top-level members of a JSONC object: key, where its value starts and ends. */
+function scanTopLevel(text) {
+  let i = 0;
+  const n = text.length;
+  const skip = () => {
+    for (;;) {
+      while (i < n && /\s/.test(text[i])) i++;
+      if (text.startsWith("//", i)) {
+        const e = text.indexOf("\n", i);
+        i = e < 0 ? n : e + 1;
+      } else if (text.startsWith("/*", i)) {
+        const e = text.indexOf("*/", i + 2);
+        i = e < 0 ? n : e + 2;
+      } else return;
+    }
+  };
+  const string = () => {
+    const s = i;
+    i++;
+    while (i < n && text[i] !== '"') i += text[i] === "\\" ? 2 : 1;
+    i++;
+    return text.slice(s, i);
+  };
+  const value = () => {
+    if (text[i] === '"') return void string();
+    if (text[i] === "{" || text[i] === "[") {
+      let depth = 0;
+      while (i < n) {
+        skip();
+        const c = text[i];
+        if (c === '"') {
+          string();
+          continue;
+        }
+        if (c === "{" || c === "[") depth++;
+        else if (c === "}" || c === "]") {
+          depth--;
+          if (depth === 0) return void i++;
+        }
+        i++;
+      }
+      throw new Error("unclosed bracket");
+    }
+    while (i < n && !/[\s,}\]/]/.test(text[i])) i++;
+  };
+  skip();
+  if (i >= n) return { open: -1, close: -1, members: [] };
+  if (text[i] !== "{") throw new Error("the file is not a JSON object");
+  const open = i++;
+  const members = [];
+  for (;;) {
+    skip();
+    if (i >= n) throw new Error("unclosed object");
+    if (text[i] === "}") return { open, close: i, members };
+    if (text[i] === ",") {
+      i++;
+      continue;
+    }
+    if (text[i] !== '"') throw new Error(`unexpected "${text[i]}" at offset ${i}`);
+    const keyStart = i;
+    const key = JSON.parse(string());
+    skip();
+    if (text[i] !== ":") throw new Error(`expected ":" after "${key}"`);
+    i++;
+    skip();
+    const valueStart = i;
+    value();
+    members.push({ key, keyStart, valueStart, valueEnd: i });
+  }
+}
+
+/** Set top-level keys in JSONC text, keeping every other line (comments included) as it was. */
+function setJsoncKeys(text, entries) {
+  if (!text.trim()) text = "{\n}\n";
+  for (const [key, val] of entries) {
+    const { open, close, members } = scanTopLevel(text);
+    const first = members[0];
+    let indent = "    ";
+    if (first) {
+      const lineStart = text.lastIndexOf("\n", first.keyStart) + 1;
+      const lead = text.slice(lineStart, first.keyStart);
+      if (/^[ \t]*$/.test(lead) && lead) indent = lead;
+    }
+    const rendered = JSON.stringify(val, null, indent).replace(/\n/g, `\n${indent}`);
+    const hit = members.find((m) => m.key === key);
+    if (hit) {
+      text = text.slice(0, hit.valueStart) + rendered + text.slice(hit.valueEnd);
+    } else if (members.length) {
+      const last = members[members.length - 1];
+      text = `${text.slice(0, last.valueEnd)},\n${indent}${JSON.stringify(key)}: ${rendered}${text.slice(last.valueEnd)}`;
+    } else {
+      text = `${text.slice(0, open + 1)}\n${indent}${JSON.stringify(key)}: ${rendered}\n${text.slice(close)}`;
+    }
+  }
+  return text;
+}
+
+// ── Docker ──────────────────────────────────────────────────────────────────
+
+function compose(docker, file, args, opts = {}) {
+  return spawnSync(docker, ["compose", "-f", file, ...args], { cwd: HERE, encoding: "utf8", ...opts });
+}
+
+function composeStatus(docker, file) {
+  const r = compose(docker, file, ["ps", "-a", "--format", "json"]);
+  if (r.status !== 0) return null;
+  const text = r.stdout.trim();
+  if (!text) return [];
+  const rows = text.startsWith("[") ? JSON.parse(text) : text.split("\n").map((l) => JSON.parse(l));
+  return rows.map((r) => ({ service: r.Service, state: r.State, health: r.Health || "" }));
+}
+
+async function waitHealthy(docker, file, services, seconds) {
+  const until = Date.now() + seconds * 1000;
+  let last = "";
+  while (Date.now() < until) {
+    const rows = composeStatus(docker, file) || [];
+    const mine = services.map((s) => rows.find((r) => r.service === s));
+    const line = mine.map((r, k) => `${services[k]}: ${r ? r.health || r.state : "missing"}`).join(", ");
+    if (line !== last) {
+      console.log(`  ${dim(line)}`);
+      last = line;
+    }
+    if (mine.every((r) => r && r.health === "healthy")) return true;
+    if (mine.some((r) => r && (r.state === "exited" || r.state === "dead"))) return false;
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+  return false;
+}
+
+async function callTool(port, key, name) {
+  const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", "X-Api-Key": key },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: {} } }),
+    signal: AbortSignal.timeout(60_000),
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok || !body) return { error: `HTTP ${res.status}` };
+  if (body.error) return { error: body.error.message };
+  const text = body.result?.content?.[0]?.text || "";
+  return body.result?.isError ? { error: text } : { value: JSON.parse(text) };
+}
+
+// ── Client configuration ────────────────────────────────────────────────────
+
+function claudeDesktopConfig() {
+  if (process.platform === "darwin") return path.join(os.homedir(), "Library", "Application Support", "Claude", "claude_desktop_config.json");
+  if (process.platform === "win32") return path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "Claude", "claude_desktop_config.json");
+  return path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "Claude", "claude_desktop_config.json");
+}
+
+function vscodeSettingsCandidates() {
+  const base =
+    process.platform === "darwin"
+      ? path.join(os.homedir(), "Library", "Application Support")
+      : process.platform === "win32"
+        ? process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming")
+        : process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+  return ["Code", "Code - Insiders", "VSCodium"].map((app) => ({ app, file: path.join(base, app, "User", "settings.json") }));
+}
+
+function readJsonObject(file) {
+  let text;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    return {};
+  }
+  if (!text.trim()) return {};
+  const value = JSON.parse(text);
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("not a JSON object");
+  return value;
+}
+
+// ── Main ────────────────────────────────────────────────────────────────────
+
+async function main() {
+  const example = Object.fromEntries(Object.entries(readEnv(path.join(HERE, ".env.example"))).filter(([, v]) => !v.startsWith("REPLACE_ME")));
+  const committed = readEnv(path.join(HERE, "defaults.env"));
+  const local = readEnv(path.join(HERE, ".env"));
+  const D = { ...example, ...committed, ...local };
+  const docker = findExe("docker");
+  const claude = findExe("claude");
+
+  console.log(`${bold("ndfc-mcp setup")} ${dim(`— Enter keeps the value in [brackets]. Defaults: ${[Object.keys(committed).length && "defaults.env", Object.keys(local).length && ".env"].filter(Boolean).join(" + ") || ".env.example"}`)}`);
+
+  // 1. How the server reaches the controller.
+  section("1. Network");
+  const mode = await choose("How does this machine reach the controller?", [
+    { key: "vpn", label: "Through the VPN sidecar", note: "compose.yaml; the containers open the tunnel themselves" },
+    { key: "direct", label: "Directly", note: "compose.direct.yaml; on the management network, or the host's own VPN is up" },
+  ], D.NDFC_MCP_COMPOSE === "direct" ? "direct" : D.NDFC_MCP_COMPOSE === "vpn" || D.VPN_SERVER ? "vpn" : "direct");
+  const composeFile = path.join(HERE, mode === "vpn" ? "compose.yaml" : "compose.direct.yaml");
+
+  // 2. The controller.
+  section("2. Controller");
+  const v = { ...D, NDFC_MCP_COMPOSE: mode };
+  v.NDFC_URL = await ask("Controller URL", D.NDFC_URL || "https://10.10.20.60", {
+    validate: (s) => {
+      try {
+        const u = new URL(s);
+        if (u.protocol !== "https:") return "use https://";
+        if (u.pathname !== "/" || u.search || u.username) return "the origin only, e.g. https://10.10.20.60";
+        return null;
+      } catch {
+        return "not a URL";
+      }
+    },
+  });
+  v.NDFC_URL = new URL(v.NDFC_URL).origin;
+  v.NDFC_USERNAME = await ask("Controller username", D.NDFC_USERNAME, { hint: "a read-only account is enough" });
+  v.NDFC_PASSWORD = await ask("Controller password", D.NDFC_PASSWORD, { secret: true });
+  const tlsDefault = D.NDFC_TLS_CA_PEM ? "pin" : /^(1|true|yes)$/i.test(D.NDFC_TLS_INSECURE || "") ? "insecure" : "verify";
+  const tls = await choose("The controller's certificate:", [
+    { key: "insecure", label: "Do not verify it", note: "a lab only; the log and /healthz say so" },
+    { key: "pin", label: "Pin its CA", note: D.NDFC_TLS_CA_PEM ? "a CA is already saved" : "fetched from the controller once the containers are up" },
+    { key: "verify", label: "Verify it against the system trust store", note: "a certificate from a public CA" },
+  ], tlsDefault);
+
+  // 3. The VPN.
+  if (mode === "vpn") {
+    section("3. VPN");
+    console.log(dim("  The gateway and login as you would type them into Cisco Secure Client. A DevNet sandbox"));
+    console.log(dim("  reservation shows them under \"VPN access\" — they change with every reservation."));
+    v.VPN_SERVER = await ask("VPN gateway", D.VPN_SERVER, { hint: "host or host:port" });
+    v.VPN_USERNAME = await ask("VPN username", D.VPN_USERNAME);
+    v.VPN_PASSWORD = await ask("VPN password", D.VPN_PASSWORD, { secret: true });
+  }
+
+  // 4. The server.
+  section(`${mode === "vpn" ? 4 : 3}. Server`);
+  const savedKey = (D.NDFC_MCP_API_KEY || "").length >= 24 ? D.NDFC_MCP_API_KEY : null;
+  if (savedKey && (await yesno("Keep the saved API key? (No generates a new one — clients are updated below)", true))) {
+    v.NDFC_MCP_API_KEY = savedKey;
+  } else {
+    v.NDFC_MCP_API_KEY = crypto.randomBytes(24).toString("hex");
+    ok("a new API key was generated");
+  }
+  const port = await ask("Port on this machine (127.0.0.1)", D.NDFC_MCP_HOST_PORT || "3300", {
+    validate: (s) => (/^\d+$/.test(s) && +s >= 1 && +s <= 65535 ? null : "a port number, 1–65535"),
+  });
+  if (port === "3300") delete v.NDFC_MCP_HOST_PORT;
+  else v.NDFC_MCP_HOST_PORT = port;
+  let start = false;
+  if (docker) start = await yesno(`Build and start the containers now (${path.basename(composeFile)})?`, true);
+  else warn("docker is not on PATH: the containers cannot be started from here, the clients can still be configured");
+
+  // 5. Clients.
+  section(`${mode === "vpn" ? 5 : 4}. Clients`);
+  const desktopFile = claudeDesktopConfig();
+  const vscode = vscodeSettingsCandidates().filter((c) => fs.existsSync(path.dirname(c.file)));
+  const clients = {};
+
+  if (await yesno(`Claude Code${claude ? "" : dim(" (the claude CLI is not on PATH)")}?`, Boolean(claude) || fs.existsSync(path.join(HERE, ".mcp.json")))) {
+    const transport = await choose("Claude Code connects over:", [
+      { key: "http", label: "HTTP", note: "the API key is in the client's configuration" },
+      { key: "stdio", label: "stdio", note: "docker compose exec; no key on the client, the containers must be running" },
+    ], "http");
+    const scopes = [
+      { key: "project", label: "This checkout, shared file", note: ".mcp.json here (git-ignored); Claude Code asks once to approve it" },
+      { key: "user", label: "Every project on this machine", note: "~/.claude.json, user scope" },
+      { key: "local", label: "This checkout, private", note: "~/.claude.json, local scope" },
+    ];
+    const scope = await choose("Where should Claude Code see it?", claude ? scopes : scopes.slice(0, 1), "project");
+    clients.code = { transport, scope };
+  }
+  if (await yesno("Claude Desktop?", fs.existsSync(path.dirname(desktopFile)))) {
+    console.log(dim("  Claude Desktop runs local servers over stdio: it starts docker compose exec itself."));
+    clients.desktop = { file: desktopFile };
+  }
+  if (await yesno("aimo for VS Code?", vscode.length > 0)) {
+    let target = vscode[0] || vscodeSettingsCandidates()[0];
+    if (vscode.length > 1) {
+      const app = await choose("Which VS Code?", vscode.map((c) => ({ key: c.app, label: c.app, note: tilde(c.file) })), vscode[0].app);
+      target = vscode.find((c) => c.app === app);
+    }
+    const transport = await choose("aimo connects over:", [
+      { key: "stdio", label: "stdio", note: "recommended: no key on the client, read-only tools run without a prompt" },
+      { key: "http", label: "HTTP", note: "the key goes into aimo's secret store by hand; aimo asks on every call" },
+    ], "stdio");
+    clients.aimo = { file: target.file, app: target.app, transport };
+  }
+
+  // Settle the TLS variables.
+  if (tls === "insecure") {
+    v.NDFC_TLS_INSECURE = "true";
+    delete v.NDFC_TLS_CA_PEM;
+  } else if (tls === "verify") {
+    delete v.NDFC_TLS_INSECURE;
+    delete v.NDFC_TLS_CA_PEM;
+  } else {
+    delete v.NDFC_TLS_INSECURE;
+  }
+  const fetchPin = tls === "pin" && !v.NDFC_TLS_CA_PEM;
+  if (fetchPin && !start) {
+    warn("pinning needs the containers running to read the controller's CA; until then the certificate is NOT verified");
+    v.NDFC_TLS_INSECURE = "true";
+  }
+  // Summary.
+  section("Summary");
+  const secretShown = (s) => (s ? dim("set (hidden)") : red("missing"));
+  const rows = [
+    ["Network", mode === "vpn" ? `VPN sidecar → ${v.VPN_SERVER} as ${v.VPN_USERNAME}, password ${secretShown(v.VPN_PASSWORD)}` : "direct"],
+    ["Controller", `${v.NDFC_URL} as ${v.NDFC_USERNAME}, password ${secretShown(v.NDFC_PASSWORD)}`],
+    ["TLS", tls === "pin" ? (fetchPin ? (start ? "pin the CA (fetched after start)" : "not verified until pinned") : "pinned CA") : tls === "insecure" ? "not verified (lab)" : "verified"],
+    ["Server", `http://127.0.0.1:${port}/mcp, API key ${savedKey && v.NDFC_MCP_API_KEY === savedKey ? "saved one" : "new"} ${dim("(hidden)")}`],
+    ["Writes", `.env${start ? `, then docker compose -f ${path.basename(composeFile)} up -d --build` : ""}`],
+  ];
+  if (clients.code) rows.push(["Claude Code", `${clients.code.transport}, ${clients.code.scope} scope`]);
+  if (clients.desktop) rows.push(["Claude Desktop", `stdio → ${tilde(clients.desktop.file)}`]);
+  if (clients.aimo) rows.push([`aimo (${clients.aimo.app})`, `${clients.aimo.transport} → ${tilde(clients.aimo.file)}`]);
+  for (const [k, s] of rows) console.log(`  ${k.padEnd(16)} ${s}`);
+  if (!(await yesno("Go ahead?", true))) {
+    console.log("Nothing was written.");
+    return;
+  }
+
+  // Write .env. The questions are over: let go of the terminal so Ctrl+C reaches docker.
+  release();
+  section("Writing");
+  const envFile = path.join(HERE, ".env");
+  ok(`.env ${writeWithBackup(envFile, renderEnv(v), 0o600)}`);
+
+  // Containers.
+  let running = false;
+  if (start) {
+    section("Containers");
+    const services = mode === "vpn" ? ["vpn", "ndfc-mcp"] : ["ndfc-mcp"];
+    const up = () => compose(docker, composeFile, ["up", "-d", "--build", "--remove-orphans"], { stdio: "inherit" }).status === 0;
+    const pinNow = fetchPin;
+    if (pinNow) {
+      // Start without verification once, to read the CA the controller presents.
+      fs.writeFileSync(envFile, renderEnv({ ...v, NDFC_TLS_INSECURE: "true" }), { mode: 0o600 });
+    }
+    if (!up()) bad("docker compose up failed (output above)");
+    else if (!(await waitHealthy(docker, composeFile, services, mode === "vpn" ? 240 : 90))) {
+      bad("the containers did not become healthy. Their last log lines:");
+      compose(docker, composeFile, ["logs", "--tail", "25"], { stdio: "inherit" });
+      if (mode === "vpn") warn("a VPN that will not connect usually means a stale reservation login: run ./setup again with the new one");
+    } else {
+      running = true;
+      ok("containers healthy");
+      if (pinNow) {
+        const r = compose(docker, composeFile, ["exec", "-T", "ndfc-mcp", "node", "/app/pin-ca.mjs"], { stdio: ["ignore", "pipe", "inherit"] });
+        const line = (r.stdout || "").split("\n").find((l) => l.startsWith("NDFC_TLS_CA_PEM="));
+        const answer = r.status === 0 && line && (await yesno("Pin this CA (subject and fingerprint above)?", true));
+        release();
+        if (answer) {
+          v.NDFC_TLS_CA_PEM = parseEnv(line).NDFC_TLS_CA_PEM;
+          delete v.NDFC_TLS_INSECURE;
+          ok(`.env ${writeWithBackup(envFile, renderEnv(v), 0o600)} — CA pinned`);
+          running = up() && (await waitHealthy(docker, composeFile, services, 90));
+        } else {
+          v.NDFC_TLS_INSECURE = "true";
+          fs.writeFileSync(envFile, renderEnv(v), { mode: 0o600 });
+          warn("not pinned: the certificate is NOT verified (NDFC_TLS_INSECURE=true). Run ./setup again to pin it");
+        }
+      }
+      if (running) {
+        try {
+          const health = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(5000) });
+          health.ok ? ok(`/healthz answers ${health.status}`) : bad(`/healthz answers ${health.status}`);
+          const info = await callTool(port, v.NDFC_MCP_API_KEY, "get_controller_info");
+          if (info.value) ok(`the controller answers: ${info.value.product || "NDFC"} ${info.value.version} (${info.value.mode})`);
+          else bad(`get_controller_info: ${String(info.error).split("\n")[0]}`);
+        } catch (e) {
+          bad(`the server does not answer on 127.0.0.1:${port}: ${e.message}`);
+        }
+      }
+    }
+  }
+
+  // Clients.
+  section("Clients");
+  const dockerCmd = docker || "docker";
+  const stdioEntry = { command: dockerCmd, args: ["compose", "-f", composeFile, "exec", "-T", "ndfc-mcp", "node", "/app/stdio.mjs"] };
+  const url = `http://127.0.0.1:${port}/mcp`;
+  const next = [];
+
+  if (clients.code) {
+    const { transport, scope } = clients.code;
+    const entry = transport === "http" ? { type: "http", url, headers: { "X-Api-Key": v.NDFC_MCP_API_KEY } } : { type: "stdio", ...stdioEntry, env: {} };
+    if (scope === "project") {
+      const file = path.join(HERE, ".mcp.json");
+      try {
+        const config = readJsonObject(file);
+        config.mcpServers = { ...(config.mcpServers || {}), [SERVER]: entry };
+        ok(`Claude Code: .mcp.json ${writeWithBackup(file, `${JSON.stringify(config, null, 2)}\n`, 0o600)}`);
+        next.push("Claude Code: open it in this directory, approve the \"ndfc\" project server when asked (or /mcp)");
+      } catch (e) {
+        bad(`Claude Code: .mcp.json is not valid JSON (${e.message}); left as it was`);
+      }
+    } else {
+      spawnSync(claude, ["mcp", "remove", SERVER, "-s", scope], { cwd: HERE, encoding: "utf8" });
+      const r = spawnSync(claude, ["mcp", "add-json", SERVER, JSON.stringify(entry), "-s", scope], { cwd: HERE, encoding: "utf8" });
+      wrote = true;
+      if (r.status === 0) {
+        ok(`Claude Code: "${SERVER}" added, ${scope} scope`);
+        next.push("Claude Code: start a new session (or /mcp) to connect");
+      } else bad(`Claude Code: claude mcp add-json failed: ${(r.stderr || r.stdout || "").trim().split("\n")[0]}`);
+    }
+  }
+
+  if (clients.desktop) {
+    try {
+      const config = readJsonObject(clients.desktop.file);
+      config.mcpServers = { ...(config.mcpServers || {}), [SERVER]: stdioEntry };
+      ok(`Claude Desktop: ${tilde(clients.desktop.file)} ${writeWithBackup(clients.desktop.file, `${JSON.stringify(config, null, 2)}\n`)}`);
+      next.push("Claude Desktop: quit it completely and open it again");
+    } catch (e) {
+      bad(`Claude Desktop: ${tilde(clients.desktop.file)} is not valid JSON (${e.message}); left as it was`);
+    }
+  }
+
+  if (clients.aimo) {
+    const { file, transport } = clients.aimo;
+    const entry =
+      transport === "stdio"
+        ? { type: "stdio", ...stdioEntry, description: DESCRIPTION }
+        : { type: "http", url, headers: { "X-Api-Key": "${secret:ndfc-api-key}" }, description: DESCRIPTION };
+    try {
+      let text = "";
+      try {
+        text = fs.readFileSync(file, "utf8");
+      } catch {}
+      const current = text.trim() ? parseJsonc(text) : {};
+      const servers = { ...(current["aimo.mcp.local.servers"] || {}), [SERVER]: entry };
+      const updated = setJsoncKeys(text, [
+        ["aimo.mcp.local.enabled", true],
+        ["aimo.mcp.local.servers", servers],
+      ]);
+      const check = parseJsonc(updated);
+      if (check["aimo.mcp.local.enabled"] !== true || JSON.stringify(check["aimo.mcp.local.servers"]?.[SERVER]) !== JSON.stringify(entry)) {
+        throw new Error("the edit did not read back as written");
+      }
+      ok(`aimo: ${tilde(file)} ${writeWithBackup(file, updated)}`);
+      next.push(`aimo: reload the VS Code window; the first call shows the command and asks once`);
+      if (transport === "http") {
+        next.push(`aimo: Command Palette → "AIMO: Set Local Server Secret" → id ndfc-api-key → paste NDFC_MCP_API_KEY from ${tilde(envFile)}`);
+      }
+    } catch (e) {
+      bad(`aimo: ${tilde(file)} could not be updated (${e.message}); left as it was`);
+    }
+  }
+
+  // The stdio bridge, when a client uses it.
+  const usesStdio = clients.desktop || clients.aimo?.transport === "stdio" || clients.code?.transport === "stdio";
+  if (usesStdio && running) {
+    const init = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "setup", version: "0" } } });
+    const r = spawnSync(dockerCmd, [...stdioEntry.args], { cwd: HERE, input: `${init}\n`, encoding: "utf8", timeout: 30_000 });
+    const answer = (r.stdout || "").split("\n").find((l) => l.includes('"serverInfo"'));
+    answer ? ok("the stdio bridge answers (what Claude Desktop and aimo will run)") : bad(`the stdio bridge did not answer: ${(r.stderr || "").trim().split("\n")[0]}`);
+  } else if (usesStdio) {
+    next.push(`stdio clients need the containers running: docker compose -f ${tilde(composeFile)} up -d --build`);
+  }
+
+  section("Done");
+  for (const s of next) console.log(`  → ${s}`);
+  console.log(`  → try: "Which fabrics does the controller manage, and are their switches in sync?"`);
+  console.log(dim(`  Run ./setup again any time; it starts from what it wrote.`));
+}
+
+main()
+  .then(() => release())
+  .catch((e) => {
+    release();
+    console.error(`\n${red("setup failed:")} ${e.message}`);
+    process.exit(1);
+  });

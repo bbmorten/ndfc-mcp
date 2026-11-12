@@ -45,6 +45,29 @@ gives you one for a few hours. Reserve it; its page lists the controller login u
 
 ## Start it
 
+The quick way — one command after cloning, which asks its questions right away:
+
+```bash
+cd ndfc-mcp
+./setup            # or: ./setup --yes   to take every default without asking
+```
+
+It needs Docker and Node 18 or newer on this machine. It asks how the controller is reached (the
+VPN sidecar or directly), the controller and VPN logins, the certificate mode, the API key and
+the port. Every answer comes pre-filled, so Enter keeps it. Then it writes `.env`, builds and
+starts the containers, and checks that the controller answers through the server. Last, it
+registers the server with **Claude Code** (`.mcp.json` here, or user/local scope through the
+`claude` CLI), **Claude Desktop** and **aimo for VS Code**. It changes only the `ndfc` entry in
+each client file and keeps a `.bak-<time>` copy beside it. Passwords are typed hidden and never
+printed. Run it again whenever a value changes: a new DevNet reservation brings a new VPN login.
+
+The defaults come from `defaults.env`, which is **committed on purpose**. It holds the values
+this project runs with, including the lab's API key, the controller login and the VPN login.
+Anyone who can read the repository can read them, so never put a production controller's
+credentials in it. A `.env` already in the checkout takes precedence over it.
+
+The manual way:
+
 ```bash
 cd ndfc-mcp
 cp .env.example .env
@@ -91,8 +114,9 @@ Same server, same `.env` (the `VPN_*` lines are ignored), same port. Use
 
 ## Connect a client
 
-`bin/client-config` prints everything below with the real paths of **your** checkout filled in,
-ready to paste. Run it once and copy the block for your client.
+`./setup` does this for you (see [Start it](#start-it)). To do it by hand, `bin/client-config`
+prints everything below with the real paths of **your** checkout filled in, ready to paste. Run it
+once and copy the block for your client.
 
 There are two ways in, and both reach the same server:
 

@@ -25,6 +25,8 @@ VPN the server has to open itself — which a cluster deployment could not do.
 | `vpn/` | the OpenConnect sidecar: `connect.sh` (connect, retry), `healthcheck.sh` (tun0 has an address) |
 | `compose.yaml` / `compose.direct.yaml` | with the VPN sidecar / without it |
 | `bin/client-config` | prints client configuration with this checkout's real paths, never the key |
+| `setup` | the interactive installer (Node, CommonJS, no dependencies): asks, writes `.env`, starts and checks the containers, configures Claude Code / Claude Desktop / aimo. Touches only the `ndfc` entry of a client file, backs it up first, keeps JSONC comments in VS Code's `settings.json`, never prints a secret |
+| `defaults.env` | `setup`'s defaults — **committed with the lab's credentials, on the owner's decision** (see Working rules) |
 | `test/verify-local.mjs` | the offline harness (stub controller on loopback) |
 | `test/live-check.mjs` | every tool against a real controller |
 | `spec/nd-fabric-controller-lan-1222.json.gz` | Cisco's OpenAPI document for NDFC 12.2.2 (Apache 2.0); data for the harness |
@@ -32,6 +34,7 @@ VPN the server has to open itself — which a cluster deployment could not do.
 ## Commands
 
 ```bash
+./setup                                    # after a clone: asks, writes .env, starts, configures clients
 node test/verify-local.mjs                 # 174 checks, no network — run after EVERY change
 node test/live-check.mjs                   # needs .env and a controller node can reach from the host
 docker compose up -d --build               # with the VPN sidecar
@@ -81,7 +84,10 @@ There is no linter and no package.json. The harness is the gate.
 ## Working rules
 
 - Never print, log or commit a credential. `.env` is git-ignored; scripts that read it print key
-  names only.
+  names only. **The one exception is `defaults.env`**: the owner decided on 2026-11-12 to commit
+  the lab's values (API key, DevNet controller and VPN logins) as `setup`'s defaults, in a
+  private repository. Keep the exception that narrow. No production credential goes there, and
+  no other file gets one.
 - The harness asserts no tool count. Keep it that way: check what each declaration must be.
 - A number in `README.md` or here (checks, tools, operations) is a claim: re-measure before
   changing it.
@@ -101,6 +107,15 @@ on `eth0` — and the server made one controller login and answered tool calls o
 and the `claude` CLI. Repeated with the host's own VPN client OFF: the host could no longer
 reach the controller (timeout, route via `en0`), the containers still could, the tools still
 answered, and the sidecar had not reconnected — the tunnel is the container's own.
+
+`./setup` is verified too (same day). Run in a simulated fresh clone with no `.env`, under a real
+TTY with Enter for every answer, it reproduced the `.env` values and `.mcp.json`. It added only
+the `ndfc` entry to Claude Desktop's config and to a JSONC `settings.json`, keeping comments and
+trailing commas, and printed no secret. Piped answers covered the direct mode, a new key,
+Claude Code at user scope through the CLI, and aimo over HTTP. A run in the real checkout left
+the containers healthy without recreating them, answered `get_controller_info`, and the stdio
+bridge answered. It *wrote* the Claude Desktop and aimo configurations, but neither client was
+run against them.
 
 **Not verified:** a gateway other than the sandbox's (a second factor, a private gateway
 certificate, another protocol); Claude Desktop; the aimo VS Code extension (the configuration follows
