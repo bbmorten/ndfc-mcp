@@ -10,3 +10,6 @@
 node_modules/
 .DS_Store
 *.log
+
+# Kept locally, never committed: the old cluster deploy files, and the sandbox access table.
+.attic/
