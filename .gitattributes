@@ -1,0 +1,9 @@
+# LF everywhere, whatever core.autocrlf says. The shell scripts are copied into
+# Linux images (a CRLF shebang stops the vpn container), and `setup` runs as-is.
+* text=auto eol=lf
+
+# Files without an extension that must stay LF.
+setup text eol=lf
+bin/client-config text eol=lf
+
+*.gz binary
