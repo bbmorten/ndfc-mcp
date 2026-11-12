@@ -98,8 +98,9 @@ sandbox gateway (`devnetsandbox-usw1-reservation.cisco.com:<port of the reservat
 `SSLClient` chosen without `VPN_AUTHGROUP`, DTLS + LZS), `tun0` got `192.168.254.x/32` and
 split-tunnel routes for `10.10.20.0/24`–`10.10.24.0/24` — the container's default route stayed
 on `eth0` — and the server made one controller login and answered tool calls over HTTP, stdio
-and the `claude` CLI. That run was made while the host's own VPN client was also connected; the
-container's routes show it used its own tunnel, but a run with the host VPN off was not made.
+and the `claude` CLI. Repeated with the host's own VPN client OFF: the host could no longer
+reach the controller (timeout, route via `en0`), the containers still could, the tools still
+answered, and the sidecar had not reconnected — the tunnel is the container's own.
 
 **Not verified:** a gateway other than the sandbox's (a second factor, a private gateway
 certificate, another protocol); Claude Desktop; the aimo VS Code extension (the configuration follows
