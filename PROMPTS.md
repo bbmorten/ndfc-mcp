@@ -14,8 +14,9 @@ and have not been run.
   out which exist.
 - **Say what to compare.** "Audit the MTU" is vague; "the two ends of every fabric link, against
   the fabric's MTU setting" is a check.
-- **Ask for what it could not check.** The server is read-only and hides some things on purpose
-  (configuration text, secrets). A good answer says which checks it could not make.
+- **Ask for what it could not check.** The server only reads (unless it was given write access)
+  and hides some things on purpose (configuration text, secrets). A good answer says which
+  checks it could not make.
 - **Ask it not to guess.** Lists are cut when they are long, and the alarm list is one page from
   the controller. "Do not report on ports you did not look at" keeps a partial answer honest.
 - **Ask for a shape**: a table, a Mermaid diagram, an ordered checklist. It is easier to act on.

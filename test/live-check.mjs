@@ -2,14 +2,28 @@
 /**
  * live-check — the REAL server against a REAL controller, end to end.
  *
- *   node test/live-check.mjs [--env .env] [--insecure]
+ *   node test/live-check.mjs [--env .env] [--insecure] [--url <origin>] [--write] [--deploy]
  *
  * Starts ndfc-mcp in this process on a loopback port, in gateway mode (the
  * stricter of the two: API key plus a signed user assertion, HS256 with a
- * secret generated here), and calls every tool over HTTP. It needs the
+ * secret generated here), and calls every read tool over HTTP. It needs the
  * controller to be reachable from THIS machine — node on the host, not the
  * container — so on a machine that reaches it only through the VPN sidecar,
- * use the compose stack and a client instead.
+ * use the compose stack and a client instead. --url replaces the controller
+ * address from the env file, for a local port forward to it.
+ *
+ * WITHOUT --write the server under test is read-only and nothing is changed.
+ *
+ * --write   CHANGES THE CONTROLLER, and puts it back: under NDFC_MCP_ACCESS=write
+ *           it checks the roles (a reader is refused, an administrator grants
+ *           write), then creates a VRF and a network named MCPCHK_*, reads them
+ *           back, and deletes both. Nothing is attached, so no switch is
+ *           touched and the deletes are not refused. Use a lab.
+ * --deploy  with --write: also attaches the VRF and the network to one leaf,
+ *           deploys, detaches, deploys again, then deletes. THIS CONFIGURES A
+ *           SWITCH. It is skipped, with a line saying so, when the controller
+ *           does not report that leaf as reachable: an attachment that cannot
+ *           be deployed stays PENDING and blocks the deletes.
  *
  * Reads the controller address and login from an env file (never printed):
  *   NEXUS_DASHBOARD_URL / NEXUS_DASHBOARD_USERNAME / NEXUS_DASHBOARD_PASSWORD
@@ -24,17 +38,26 @@
  */
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 
+import { GRANT_TOOLS } from "../server/grants.mjs";
 import { createServer, loadConfig } from "../server/server.mjs";
-import { TOOLS } from "../server/tools.mjs";
+import { READ_TOOLS, WRITE_TOOLS } from "../server/tools.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const argv = process.argv.slice(2);
 const envFile = argv.includes("--env") ? argv[argv.indexOf("--env") + 1] : path.join(HERE, "..", ".env");
 const insecure = argv.includes("--insecure");
+const urlOverride = argv.includes("--url") ? argv[argv.indexOf("--url") + 1] : null;
+const doWrite = argv.includes("--write");
+const doDeploy = argv.includes("--deploy");
+if (doDeploy && !doWrite) {
+  console.error("--deploy needs --write");
+  process.exit(2);
+}
 
 function readEnvFile(file) {
   const out = {};
@@ -82,7 +105,7 @@ const ok = (name, pass, detail = "") => {
 };
 
 const file = readEnvFile(envFile);
-const origin = file.NDFC_URL || file.NEXUS_DASHBOARD_URL;
+const origin = urlOverride || file.NDFC_URL || file.NEXUS_DASHBOARD_URL;
 const username = file.NDFC_USERNAME || file.NEXUS_DASHBOARD_USERNAME;
 const password = file.NDFC_PASSWORD || file.NEXUS_DASHBOARD_PASSWORD;
 if (!origin || !username || !password) {
@@ -102,8 +125,17 @@ const env = {
   NDFC_USERNAME: username,
   NDFC_PASSWORD: password,
 };
+const ADMIN_EMAIL = "live-check-admin@example.invalid";
+const WRITER_EMAIL = "live-check-writer@example.invalid";
+const dataDir = doWrite ? fs.mkdtempSync(path.join(os.tmpdir(), "ndfc-mcp-live-")) : null;
+if (doWrite) {
+  env.NDFC_MCP_ACCESS = "write";
+  env.NDFC_MCP_ADMIN_EMAILS = ADMIN_EMAIL;
+  env.NDFC_MCP_DATA_DIR = dataDir;
+}
 
 console.log(`controller: ${origin}`);
+console.log(doWrite ? `access: WRITE — this run changes the controller${doDeploy ? " AND CONFIGURES A SWITCH" : ""}` : "access: read (nothing is changed)");
 if (insecure) {
   env.NDFC_TLS_INSECURE = "true";
   console.log("TLS: --insecure (certificate NOT verified)");
@@ -133,10 +165,10 @@ function signAssertion(claims = {}) {
   return `${head}.${body}.${sig}`;
 }
 
-async function rpc(method, params, { assertion = true } = {}) {
+async function rpc(method, params, { assertion = true, as = null } = {}) {
   const res = await fetch(`${base}/mcp`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Api-Key": apiKey, "MCP-Protocol-Version": "2025-06-18", ...(assertion ? { "X-GpuPool-User-Assertion": signAssertion() } : {}) },
+    headers: { "Content-Type": "application/json", "X-Api-Key": apiKey, "MCP-Protocol-Version": "2025-06-18", ...(assertion ? { "X-GpuPool-User-Assertion": signAssertion(as ? { sub: as, email: as } : {}) } : {}) },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
   });
   const text = await res.text();
@@ -144,9 +176,9 @@ async function rpc(method, params, { assertion = true } = {}) {
 }
 
 const everything = [];
-async function call(name, args = {}) {
+async function call(name, args = {}, as = null) {
   const started = Date.now();
-  const r = await rpc("tools/call", { name, arguments: args });
+  const r = await rpc("tools/call", { name, arguments: args }, { as });
   const result = r.json?.result;
   const inner = result?.content?.[0]?.text ? JSON.parse(result.content[0].text) : null;
   everything.push(r.text);
@@ -158,7 +190,12 @@ try {
   const init = await rpc("initialize", {}, { assertion: false });
   ok("initialize answers without a user", init.status === 200 && init.json.result?.protocolVersion === "2025-06-18");
   const list = await rpc("tools/list", {}, { assertion: false });
-  ok(`tools/list returns the ${TOOLS.length} declared tools, all read-only`, list.json.result?.tools?.length === TOOLS.length && list.json.result.tools.every((t) => t.annotations?.readOnlyHint === true));
+  const offered = [...READ_TOOLS, ...(doWrite ? [...WRITE_TOOLS, ...GRANT_TOOLS] : [])];
+  const listedTools = list.json.result?.tools || [];
+  ok(
+    doWrite ? `tools/list returns ${READ_TOOLS.length} read, ${WRITE_TOOLS.length} write and ${GRANT_TOOLS.length} grant tools` : `tools/list returns the ${READ_TOOLS.length} read tools, all read-only, and no write tool`,
+    listedTools.map((t) => t.name).join() === offered.map((t) => t.name).join() && listedTools.filter((t) => READ_TOOLS.some((r) => r.name === t.name)).every((t) => t.annotations?.readOnlyHint === true)
+  );
   const nokey = await fetch(`${base}/mcp`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) });
   ok("a request without the API key is 401", nokey.status === 401);
   const anon = await rpc("tools/call", { name: "list_fabrics", arguments: {} }, { assertion: false });
@@ -228,6 +265,109 @@ try {
   const extra = await call("list_fabrics", { asUser: "admin" });
   ok("an undeclared argument is refused", extra.isError && extra.data?.error === "invalid_arguments");
 
+  if (doWrite) {
+    const VRF = "MCPCHK_VRF";
+    const NET = "MCPCHK_NET";
+    const vrfNames = async () => ((await call("list_vrfs", { fabricName })).data?.vrfs || []).map((v) => v.vrfName);
+    const netNames = async () => ((await call("list_networks", { fabricName })).data?.networks || []).map((v) => v.networkName);
+    const line = (r) => (r.isError ? `${r.data?.error} httpStatus ${r.data?.httpStatus}: ${r.data?.message}` : JSON.stringify(r.data));
+
+    console.log("\nroles (gateway mode, NDFC_MCP_ACCESS=write)");
+    const before = { vrfs: await vrfNames(), nets: await netNames() };
+    const denied = await call("create_vrf", { fabricName, vrfName: VRF }, WRITER_EMAIL);
+    ok("a person with no grant is refused a write (write_not_allowed)", denied.isError && denied.data?.error === "write_not_allowed", line(denied));
+    ok("and the controller was not changed", !(await vrfNames()).includes(VRF) || before.vrfs.includes(VRF));
+    const notAdmin = await call("grant_set", { email: WRITER_EMAIL, role: "write" }, WRITER_EMAIL);
+    ok("that person cannot grant themselves write (admin_required)", notAdmin.isError && notAdmin.data?.error === "admin_required", line(notAdmin));
+    const granted = await call("grant_set", { email: WRITER_EMAIL, role: "write" }, ADMIN_EMAIL);
+    ok("the administrator grants them write", !granted.isError && granted.data?.role === "write", line(granted));
+
+    console.log("\nwrite tools against the live controller (as the granted person)");
+    if (before.vrfs.includes(VRF) || before.nets.includes(NET)) {
+      ok(`${VRF} / ${NET} do not exist before the run`, false, "left over from an earlier run: delete them on the controller, then run again");
+      throw new Error("leftover");
+    }
+    const mkVrf = await call("create_vrf", { fabricName, vrfName: VRF, description: "ndfc-mcp live-check" }, WRITER_EMAIL);
+    ok("create_vrf", !mkVrf.isError && mkVrf.data?.changed === true, `${line(mkVrf)} (${mkVrf.ms} ms)`);
+    ok("list_vrfs shows it", (await vrfNames()).includes(VRF));
+    const dup = await call("create_vrf", { fabricName, vrfName: VRF }, WRITER_EMAIL);
+    ok("creating it again is the controller's refusal, as an error result", dup.isError && dup.data?.error === "controller_refused_change", line(dup));
+    const mkNet = await call("create_network", { fabricName, networkName: NET, vrfName: VRF, gatewayIpAddress: "192.0.2.1/24", description: "ndfc-mcp live-check" }, WRITER_EMAIL);
+    ok("create_network", !mkNet.isError && mkNet.data?.changed === true, `${line(mkNet)} (${mkNet.ms} ms)`);
+    ok("list_networks shows it", (await netNames()).includes(NET));
+    const vAtt = await call("list_vrf_attachments", { fabricName, vrfName: VRF });
+    ok("list_vrf_attachments: attached nowhere", !vAtt.isError && vAtt.data.attachments.every((a) => a.attached === false), `${vAtt.data?.totalRows} switches: ${(vAtt.data?.attachments || []).map((a) => `${a.switch}=${a.state}`).join(" ")}`);
+    const nAtt = await call("list_network_attachments", { fabricName, networkName: NET });
+    ok("list_network_attachments: attached nowhere", !nAtt.isError && nAtt.data.attachments.every((a) => a.attached === false), `${nAtt.data?.totalRows} switches`);
+    const early = await call("delete_vrf", { fabricName, vrfName: VRF }, WRITER_EMAIL);
+    ok("delete_vrf while it has a network is refused by the controller", early.isError && early.data?.error === "controller_refused_change", line(early));
+    const spine = rows.find((s) => s.fabricName === fabricName && s.role === "spine");
+    if (spine) {
+      const onSpine = await call("attach_vrf", { fabricName, vrfName: VRF, serialNumber: spine.serialNumber }, WRITER_EMAIL);
+      ok("attach_vrf to a spine is refused (a refusal inside an HTTP 200)", onSpine.isError && onSpine.data?.error === "controller_refused_change", line(onSpine));
+    }
+
+    if (doDeploy) {
+      const leaf = (await call("list_switches", { fabricName })).data.switches.find((s) => s.role === "leaf");
+      if (!leaf || leaf.status !== "ok") {
+        console.log(`  – deploy cycle SKIPPED: ${leaf ? `${leaf.hostName} is "${leaf.status}"` : "no leaf"} — an attachment that cannot be deployed stays PENDING and blocks the deletes`);
+      } else {
+        console.log(`\ndeploy cycle on ${leaf.hostName} (${leaf.serialNumber}) — THIS CONFIGURES THE SWITCH`);
+        const state = async () => {
+          const a = (await call("list_vrf_attachments", { fabricName, vrfName: VRF })).data.attachments.find((x) => x.serialNumber === leaf.serialNumber);
+          const b = (await call("list_network_attachments", { fabricName, networkName: NET })).data.attachments.find((x) => x.serialNumber === leaf.serialNumber);
+          return `vrf ${a?.attached}/${a?.state}, network ${b?.attached}/${b?.state}`;
+        };
+        const settle = async (want) => {
+          for (let i = 0; i < 24; i += 1) {
+            const s = await state();
+            if (want.test(s)) return s;
+            await new Promise((r) => setTimeout(r, 5000));
+          }
+          return state();
+        };
+        const steps = [
+          ["attach_vrf", { fabricName, vrfName: VRF, serialNumber: leaf.serialNumber }],
+          ["attach_network", { fabricName, networkName: NET, serialNumber: leaf.serialNumber }],
+          ["deploy_vrf", { fabricName, vrfName: VRF }],
+          ["deploy_network", { fabricName, networkName: NET }],
+        ];
+        for (const [tool, a] of steps) {
+          const r = await call(tool, a, WRITER_EMAIL);
+          ok(tool, !r.isError, `${line(r)} (${r.ms} ms)`);
+        }
+        const up = await settle(/vrf true\/DEPLOYED, network true\/DEPLOYED/);
+        ok("both are DEPLOYED on the leaf", /vrf true\/DEPLOYED, network true\/DEPLOYED/.test(up), up);
+        for (const [tool, a] of [
+          ["detach_network", { fabricName, networkName: NET, serialNumber: leaf.serialNumber }],
+          ["deploy_network", { fabricName, networkName: NET }],
+          ["detach_vrf", { fabricName, vrfName: VRF, serialNumber: leaf.serialNumber }],
+          ["deploy_vrf", { fabricName, vrfName: VRF }],
+        ]) {
+          const r = await call(tool, a, WRITER_EMAIL);
+          ok(tool, !r.isError, `${line(r)} (${r.ms} ms)`);
+        }
+        const down = await settle(/vrf false\/NA, network false\/NA/);
+        ok("both are detached (NA) again", /vrf false\/NA, network false\/NA/.test(down), down);
+      }
+    }
+
+    const rmNet = await call("delete_network", { fabricName, networkName: NET }, WRITER_EMAIL);
+    ok("delete_network", !rmNet.isError && rmNet.data?.changed === true, `${line(rmNet)} (${rmNet.ms} ms)`);
+    const rmVrf = await call("delete_vrf", { fabricName, vrfName: VRF }, WRITER_EMAIL);
+    ok("delete_vrf", !rmVrf.isError && rmVrf.data?.changed === true, `${line(rmVrf)} (${rmVrf.ms} ms)`);
+    const after = { vrfs: await vrfNames(), nets: await netNames() };
+    ok("the controller is as it was: the same VRFs and networks as before the run", JSON.stringify(after) === JSON.stringify(before), `VRFs ${after.vrfs.length}, networks ${after.nets.length}`);
+    const gone = await call("delete_vrf", { fabricName, vrfName: VRF }, WRITER_EMAIL);
+    ok("deleting it again is the controller's refusal", gone.isError && gone.data?.error === "controller_refused_change", line(gone));
+
+    const revoked = await call("grant_revoke", { email: WRITER_EMAIL }, ADMIN_EMAIL);
+    ok("the administrator revokes the grant", !revoked.isError && revoked.data?.role === "read");
+    const again = await call("create_vrf", { fabricName, vrfName: VRF }, WRITER_EMAIL);
+    ok("and the person is read-only again", again.isError && again.data?.error === "write_not_allowed");
+    ok("every change is in the server's log with who made it", lines.filter((l) => /access=write/.test(l) && /outcome=ok/.test(l)).every((l) => l.includes(`user=${WRITER_EMAIL}`)) && lines.some((l) => /tool=create_vrf .*access=write.*outcome=ok/.test(l)));
+  }
+
   console.log("\nwhat never appears in any result");
   const all = everything.join("\n");
   ok("the controller password", !all.includes(password));
@@ -237,13 +377,17 @@ try {
   const health = await (await fetch(`${base}/healthz`)).json();
   console.log(`\ncontroller logins made by the server: ${health.controller.logins} (failures ${health.controller.loginFailures}) for ${everything.length} tool calls; TLS mode ${health.controllerTls}`);
   ok("one login served every call (the token is cached)", health.controller.logins === 1 && health.controller.loginFailures === 0);
+  ok(doWrite ? "the server sent writes, and /healthz counts them" : "a read-only run sent no write", doWrite ? health.controller.writes > 0 : health.controller.writes === 0, `${health.controller.writes} writes, ${health.controller.writeFailures} refused or failed`);
 } catch (error) {
-  if (error.message !== "tls") {
+  if (error.message === "leftover") {
+    // already reported as a failed check
+  } else if (error.message !== "tls") {
     failed += 1;
     console.error("live-check crashed:", error);
   } else failed += 1;
 } finally {
   server.close();
+  if (dataDir) fs.rmSync(dataDir, { recursive: true, force: true });
 }
 
 console.log(failed === 0 ? "\nALL PASS" : `\n${failed} CHECK(S) FAILED`);

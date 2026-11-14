@@ -1,13 +1,20 @@
 /**
- * ndfc-mcp — read-only Cisco Nexus Dashboard Fabric Controller tools, served
- * as a stateless MCP server: streamable HTTP, protocol 2025-06-18, plain JSON
+ * ndfc-mcp — Cisco Nexus Dashboard Fabric Controller tools, served as a
+ * stateless MCP server: streamable HTTP, protocol 2025-06-18, plain JSON
  * responses, no sessions. stdio.mjs is the same server for clients that speak
  * MCP over stdin/stdout.
  *
- * What it is: twelve read tools over one controller's REST API (tools.mjs), a
- * GET-only controller client (ndfc.mjs), and this plumbing. It changes nothing
- * on the controller or on a switch, by construction rather than by convention
- * — see ndfc.mjs.
+ * What it is: read tools and write tools over one controller's REST API
+ * (tools.mjs), a controller client that sends only declared endpoints
+ * (ndfc.mjs), and this plumbing.
+ *
+ * READ-ONLY UNLESS CONFIGURED OTHERWISE. NDFC_MCP_ACCESS is the server's
+ * ceiling. `read` (the default): the write tools are not listed, cannot be
+ * called, and the controller client is built with no write route at all — the
+ * server changes nothing, by construction. `write`: the write tools are
+ * offered, and each call needs a caller who holds the write role (grants.mjs):
+ * in local mode that is the one person running the container; in gateway mode
+ * it is a person an administrator granted it to.
  *
  * Who may call it (auth.mjs):
  *   - Every request carries the API key (X-Api-Key, or a bearer token). No
@@ -18,14 +25,19 @@
  *     assertion that IS present is verified on every method, and a bad one is
  *     401 — a presented credential that fails is never ignored.
  *
- * The server reads the controller with ONE account (NDFC_USERNAME), so everyone
- * who can call it sees what that account sees. Give it a read-only one.
+ * The server uses ONE account on the controller (NDFC_USERNAME), so everyone
+ * who can call it sees what that account sees, and a caller with the write role
+ * changes the controller as that account. Give a read-only server a read-only
+ * account.
  *
  * Env — required: NDFC_MCP_API_KEY, NDFC_URL, NDFC_USERNAME, NDFC_PASSWORD.
  * Optional: NDFC_MCP_PORT (3300), NDFC_LOGIN_DOMAIN (DefaultAuth),
  *   NDFC_TLS_CA_PEM | NDFC_TLS_INSECURE, NDFC_TIMEOUT_MS (20000),
  *   NDFC_MCP_RESULT_BUDGET_BYTES (26000), NDFC_MCP_MODE (local | gateway) and,
  *   for gateway mode, NDFC_MCP_SLUG plus one assertion verifier (auth.mjs).
+ *   NDFC_MCP_ACCESS (read | write), NDFC_WRITE_TIMEOUT_MS (90000) and, for
+ *   gateway mode under write, NDFC_MCP_ADMIN_EMAILS and NDFC_MCP_DATA_DIR
+ *   (grants.mjs).
  */
 import fs from "node:fs";
 import http from "node:http";
@@ -33,15 +45,21 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { AuthError, apiKeyOk, createAssertionVerifier, loadAuthConfig, presentedApiKey } from "./auth.mjs";
+import { GRANT_TOOLS, createGrantStore, loadAccessConfig, roleAllows } from "./grants.mjs";
 import { createNdfcClient, loadNdfcConfig } from "./ndfc.mjs";
 import {
+  READ_TOOLS,
   RESULT_BUDGET_BYTES,
   SERVER_INSTRUCTIONS,
-  TOOLS,
   ToolError,
+  WRITE_ENDPOINTS,
+  WRITE_INSTRUCTIONS,
+  WRITE_TOOLS,
+  accessOf,
   createRateLimiter,
   encodeToolError,
   encodeToolResult,
+  endpointsOf,
   toolError,
   validateArgs,
 } from "./tools.mjs";
@@ -50,19 +68,30 @@ const PROTOCOL_VERSION = "2025-06-18";
 // A later request names the revision it negotiated. These are the revisions
 // whose tools/call shape this server answers; anything else is a 400.
 const KNOWN_PROTOCOL_VERSIONS = new Set(["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]);
-export const SERVER_INFO = { name: "ndfc-mcp", version: "0.2.0" };
+export const SERVER_INFO = { name: "ndfc-mcp", version: "0.3.0" };
 const MAX_BODY_BYTES = 1024 * 1024;
 
 /** Read every setting; returns { config, missing[] }. Nothing has a default that could be wrong. */
 export function loadConfig(env = process.env) {
   const auth = loadAuthConfig(env);
   const ndfc = loadNdfcConfig(env);
-  const missing = [...auth.missing, ...ndfc.missing];
+  const access = loadAccessConfig(env, auth.config.mode);
+  const missing = [...auth.missing, ...ndfc.missing, ...access.missing];
   const port = Number.parseInt(env.NDFC_MCP_PORT || "3300", 10);
   if (!Number.isInteger(port) || port < 1 || port > 65535) missing.push("NDFC_MCP_PORT is not a port number");
   const budgetBytes = Number.parseInt(env.NDFC_MCP_RESULT_BUDGET_BYTES || String(RESULT_BUDGET_BYTES), 10);
   if (!Number.isInteger(budgetBytes) || budgetBytes < 2000 || budgetBytes > 900_000) missing.push("NDFC_MCP_RESULT_BUDGET_BYTES must be between 2000 and 900000");
-  return { missing, config: { port, budgetBytes, auth: auth.config, ndfc: ndfc.config } };
+  return { missing, config: { port, budgetBytes, auth: auth.config, ndfc: ndfc.config, access: access.config } };
+}
+
+/**
+ * The tools this server offers, decided once from its configuration:
+ * the read tools always; the write tools under a write ceiling; the grant
+ * tools where there are grants to manage (gateway mode under a write ceiling).
+ */
+export function offeredTools(config) {
+  const writing = config.access.access === "write";
+  return [...READ_TOOLS, ...(writing ? WRITE_TOOLS : []), ...(writing && config.auth.mode === "gateway" ? GRANT_TOOLS : [])];
 }
 
 function readBody(req) {
@@ -102,7 +131,15 @@ const rpcResult = (res, id, result) => send(res, 200, { jsonrpc: "2.0", id, resu
 export function createServer(config, deps = {}) {
   const gateway = config.auth.mode === "gateway";
   const verifyAssertion = gateway ? deps.verifyAssertion || createAssertionVerifier(config.auth, deps) : null;
-  const ndfc = deps.ndfc || createNdfcClient(config.ndfc, deps);
+  const writing = config.access.access === "write";
+  const tools = offeredTools(config);
+  // A read-only server builds a client with no write route: it cannot change
+  // the controller whatever reaches tools/call.
+  const ndfc = deps.ndfc || createNdfcClient(config.ndfc, { ...deps, writeEndpoints: writing ? WRITE_ENDPOINTS : [] });
+  const grants = writing && gateway ? deps.grants || createGrantStore({ dataDir: config.access.dataDir, adminEmails: config.access.adminEmails, now: deps.now }) : null;
+  /** The caller's role: the ceiling itself in local mode, the person's grant in gateway mode. Never above the ceiling. */
+  const roleOf = (user) => (!writing ? "read" : gateway ? grants.roleOf(user.email) : "write");
+  const instructions = writing ? `${SERVER_INSTRUCTIONS}\n${WRITE_INSTRUCTIONS}` : SERVER_INSTRUCTIONS;
   // Per caller, and across all callers: every call is a request to a network
   // controller that has better things to do than serve a tool loop.
   const perUser = createRateLimiter({ capacity: 30, refillPerSecond: 1, ...(deps.userLimit || {}) });
@@ -122,8 +159,10 @@ export function createServer(config, deps = {}) {
         ok: true,
         server: SERVER_INFO.name,
         version: SERVER_INFO.version,
-        tools: TOOLS.length,
+        tools: tools.length,
         mode: config.auth.mode,
+        access: config.access.access,
+        ...(grants ? { grants: grants.stats() } : {}),
         controllerHost: config.ndfc.host,
         controllerTls: config.ndfc.tlsMode,
         ...(gateway ? { assertionAlg: config.auth.alg } : {}),
@@ -195,7 +234,7 @@ export function createServer(config, deps = {}) {
             protocolVersion: PROTOCOL_VERSION,
             capabilities: { tools: {} },
             serverInfo: SERVER_INFO,
-            instructions: SERVER_INSTRUCTIONS,
+            instructions,
           });
 
         case "notifications/initialized":
@@ -208,29 +247,60 @@ export function createServer(config, deps = {}) {
 
         case "tools/list":
           return rpcResult(res, id, {
-            tools: TOOLS.map(({ name, title, description, inputSchema, annotations }) => ({ name, title, description, inputSchema, annotations })),
+            tools: tools.map(({ name, title, description, inputSchema, annotations }) => ({ name, title, description, inputSchema, annotations })),
           });
 
         case "tools/call": {
-          const tool = TOOLS.find((t) => t.name === params?.name);
+          // A tool this server does not offer does not exist here: on a read-only
+          // server `create_vrf` is as unknown as `no_such_tool`.
+          const tool = tools.find((t) => t.name === params?.name);
           if (!tool) return rpcError(res, id, -32602, `unknown tool: ${String(params?.name).slice(0, 64)}`);
           const args = params?.arguments ?? {};
+          const need = accessOf(tool);
+          const changes = need !== "read";
           const envelope = (result) => ({ jsonrpc: "2.0", id, result });
           const started = Date.now();
+          let validated = false;
           const done = (body, outcome) => {
-            log(`level=info msg="tool call" tool=${tool.name} user=${user ? user.userId : "-"} outcome=${outcome} ms=${Date.now() - started} bytes=${Buffer.byteLength(body)}`);
+            // A change is logged with what was asked for — once its arguments
+            // have passed validation, which is what makes them names and
+            // numbers and never something a caller pasted by mistake.
+            const what = changes ? ` access=${need}${validated ? ` args=${JSON.stringify(JSON.stringify(args)).slice(0, 600)}` : ""}` : "";
+            log(`level=info msg="tool call" tool=${tool.name} user=${user ? user.userId : "-"}${what} outcome=${outcome} ms=${Date.now() - started} bytes=${Buffer.byteLength(body)}`);
             return send(res, 200, body);
           };
-          const fail = (err) => done(encodeToolError(err, envelope, { log: onUnexpected }), err instanceof ToolError ? err.code : "tool_failed");
+          const fail = (err) => done(encodeToolError(err, envelope, { log: onUnexpected, write: changes }), err instanceof ToolError ? err.code : "tool_failed");
 
           // Everything abnormal from here on is a tool RESULT, not an RPC
           // error: the model can read it and adapt.
           if (!user) return fail(toolError(401, "identity_required", "This tool needs to know who is calling. Call it through a client that signs you in; a shared service key cannot be used here."));
           if (!perUser(`user:${user.userId}`) || !perService("svc")) return fail(toolError(429, "rate_limited", "Too many tool calls; wait and retry."));
+          // The role, before the arguments: a read-only caller learns nothing
+          // about what a write would have accepted.
+          if (!roleAllows(roleOf(user), need)) {
+            return fail(
+              need === "admin"
+                ? toolError(403, "admin_required", "This tool manages who may use the server and needs the admin role.")
+                : toolError(403, "write_not_allowed", "You have read-only access to this server; this tool changes the controller.")
+            );
+          }
           const problems = validateArgs(tool.inputSchema, args);
           if (problems.length) return fail(toolError(400, "invalid_arguments", problems.join("; ")));
+          validated = true;
           try {
-            const value = await tool.handler({ args, callApi: (path, query) => ndfc.get(tool.endpoint, path, query) });
+            let value;
+            if (need === "admin") value = await tool.handler({ args, user, store: grants });
+            else {
+              const declared = endpointsOf(tool);
+              // One entry point for every controller call a handler makes: the
+              // endpoint must be one the tool declared, and its method decides
+              // whether it is a read or THE write.
+              const api = (endpoint, path, { query, body } = {}) => {
+                if (!declared.includes(endpoint)) throw new ToolError(500, "endpoint_mismatch", "The tool tried to call an endpoint it did not declare.");
+                return endpoint.startsWith("GET ") ? ndfc.get(endpoint, path, query) : ndfc.send(endpoint, path, { query, body });
+              };
+              value = await tool.handler({ args, api, callApi: (path, query) => api(tool.endpoint, path, { query }) });
+            }
             return done(encodeToolResult(value, envelope, { budgetBytes: config.budgetBytes, hint: tool.narrowHint }), "ok");
           } catch (error) {
             return fail(error);
@@ -279,8 +349,14 @@ if (isMain) {
   }
   const srv = createServer(config);
   srv.listen(config.port, () => {
+    if (config.access.access === "write") {
+      console.log(
+        `level=warn msg="NDFC_MCP_ACCESS=write: this server offers tools that change the controller and deploy to switches" ` +
+          (config.auth.mode === "gateway" ? `administrators=${config.access.adminEmails.length}` : 'who="anyone holding the API key"')
+      );
+    }
     console.log(
-      `level=info msg="ndfc-mcp ${SERVER_INFO.version} listening" port=${config.port} tools=${TOOLS.length} mode=${config.auth.mode} ` +
+      `level=info msg="ndfc-mcp ${SERVER_INFO.version} listening" port=${config.port} tools=${offeredTools(config).length} mode=${config.auth.mode} access=${config.access.access} ` +
         `controller=${config.ndfc.host} tls=${config.ndfc.tlsMode}`
     );
   });

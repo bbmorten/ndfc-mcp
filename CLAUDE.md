@@ -5,10 +5,11 @@ file holds what a change must not break.
 
 ## What this is
 
-**ndfc-mcp** — a read-only MCP server for Cisco Nexus Dashboard Fabric Controller, run locally
-with Docker Compose. Two containers: `vpn` (OpenConnect, owns the AnyConnect tunnel and the
-network namespace) and `ndfc-mcp` (the server, in that namespace). Node 22, **zero npm
-dependencies**, no build step.
+**ndfc-mcp** — an MCP server for Cisco Nexus Dashboard Fabric Controller, run locally with
+Docker Compose. **Read-only unless `NDFC_MCP_ACCESS=write`**; with it, twelve write tools for
+VRFs and overlay networks (since 0.3.0, 2026-11-14, asked for by the owner). Two containers:
+`vpn` (OpenConnect, owns the AnyConnect tunnel and the network namespace) and `ndfc-mcp` (the
+server, in that namespace). Node 22, **zero npm dependencies**, no build step.
 
 It began on 2026-11-11/12 as `deploy-ndfc-mcp/` inside the GPU Pool platform repository and
 became this independent project the same day, because the only way to reach a controller was a
@@ -16,28 +17,30 @@ VPN the server has to open itself — which a cluster deployment could not do.
 
 | Path | What |
 | --- | --- |
-| `server/tools.mjs` | the twelve tool declarations, `EXCLUDED_ENDPOINTS`, argument validation, redaction, the byte budget, error guidance, the rate limiter. **No side effects at import** — the harness imports it |
-| `server/ndfc.mjs` | the controller client: login + token cache, GET only, endpoint containment, TLS modes, no redirects |
+| `server/tools.mjs` | the tool declarations (read tools and write tools), `EXCLUDED_ENDPOINTS`, argument validation, redaction, the byte budget, error guidance for reads and for writes, the rate limiter. **No side effects at import** — the harness imports it |
+| `server/ndfc.mjs` | the controller client: login + token cache, `get()` and `send()`, endpoint containment, the write list, TLS modes, no redirects |
 | `server/auth.mjs` | the API key; in gateway mode, user-assertion verification |
-| `server/server.mjs` | MCP over HTTP, `loadConfig` (fail closed), the call log |
+| `server/grants.mjs` | who may write: the access ceiling, the roles, the grant store and the three grant tools |
+| `server/server.mjs` | MCP over HTTP, `loadConfig` (fail closed), which tools are offered, the role check, the call log |
 | `server/stdio.mjs` | MCP over stdin/stdout — a bridge to the HTTP server in the same container, not a second implementation |
 | `server/pin-ca.mjs` | prints `NDFC_TLS_CA_PEM` for the controller's CA |
-| `vpn/` | the OpenConnect sidecar: `connect.sh` (connect, retry), `healthcheck.sh` (tun0 has an address) |
+| `vpn/` | the OpenConnect sidecar: `connect.sh` (connect, retry; `VPN_MODE` tunnel or proxy), `healthcheck.sh` (tun0 has an address; in proxy mode, ocproxy runs and each forward accepts), `proxy-hook.sh` (proxy mode only: becomes ocproxy) |
 | `compose.yaml` / `compose.direct.yaml` | with the VPN sidecar / without it |
 | `bin/client-config` | prints client configuration with this checkout's real paths, never the key. Node (CommonJS, no dependencies) since the Windows work; on POSIX its output is byte-identical to the `sh` script it replaced, on Windows the two `claude` lines are PowerShell |
 | `setup.cmd`, `bin/client-config.cmd` | Windows launchers: `node` on the script beside them. CRLF (`.gitattributes`); everything else is LF |
 | `setup` | the interactive installer (Node, CommonJS, no dependencies): asks, writes `.env`, starts and checks the containers, configures Claude Code / Claude Desktop / aimo. Touches only the `ndfc` entry of a client file, backs it up first, keeps JSONC comments in VS Code's `settings.json`, never prints a secret |
 | `defaults.env` | `setup`'s defaults — **committed with the lab's credentials, on the owner's decision** (see Working rules) |
 | `test/verify-local.mjs` | the offline harness (stub controller on loopback) |
-| `test/live-check.mjs` | every tool against a real controller |
+| `test/live-check.mjs` | every read tool against a real controller; `--write` and `--deploy` change it and put it back |
 | `spec/nd-fabric-controller-lan-1222.json.gz` | Cisco's OpenAPI document for NDFC 12.2.2 (Apache 2.0); data for the harness |
 
 ## Commands
 
 ```bash
 ./setup                                    # after a clone: asks, writes .env, starts, configures clients (Windows: .\setup)
-node test/verify-local.mjs                 # 175 checks, no network — run after EVERY change
-node test/live-check.mjs                   # needs .env and a controller node can reach from the host
+node test/verify-local.mjs                 # 294 checks, no network — run after EVERY change
+node test/live-check.mjs                   # needs .env and a controller node can reach from the host; changes nothing
+node test/live-check.mjs --write           # CHANGES THE CONTROLLER and puts it back (a lab); --deploy also configures a leaf
 docker compose up -d --build               # with the VPN sidecar
 docker compose -f compose.direct.yaml up -d --build   # controller already reachable
 ```
@@ -46,15 +49,42 @@ There is no linter and no package.json. The harness is the gate.
 
 ## What must survive a refactor
 
-- **Read-only by construction.** Every tool declares one `endpoint`; `tools.mjs` throws at load
-  if one is not a `GET`; `ndfc.mjs`'s `get()` refuses any path that is not the calling tool's
-  declared endpoint before a byte leaves the server; the module makes exactly one POST, the
-  login. The harness pins that by reading the source. **A write tool is the owner's decision,
-  asked for explicitly — never added as part of another change.**
-- **Every controller route not in `TOOLS` is unreachable.** NDFC has 455 GET operations; this
-  server reaches twelve. `EXCLUDED_ENDPOINTS` records the ones deliberately left out, each with
-  a reason. A new tool needs: the endpoint in the spec (the harness checks), a strict
-  `inputSchema`, `readOnlyHint`, redaction decided, and a harness check for its result.
+- **Read-only by construction, by default.** `NDFC_MCP_ACCESS` is the server's ceiling and
+  defaults to `read`. Under it the write tools and grant tools are not offered (a call to one
+  is `unknown tool`), and the controller client is built with an EMPTY write list, so `send()`
+  refuses every POST, PUT and DELETE whatever calls it. The harness pins both, and reads the
+  source for the three places a method is named (the login, `get()`, `send()`).
+- **A write is declared, single and built here.** A write tool declares ONE `POST|PUT|DELETE`
+  endpoint (plus GETs under `also`), `readOnlyHint: false`, whether it is destructive and
+  idempotent, and a description that starts with `WRITE`. Its body is built in the handler from
+  validated arguments. **No write argument is a template name, free-form configuration, a
+  credential or a raw body**, and every string argument has a pattern that admits no newline,
+  quote or command separator: a name or description ends up in device configuration. A write is
+  sent once; the only retry is after a 401. The harness checks all of this per declaration.
+- **Which writes exist is the owner's decision.** The twelve of 0.3.0 cover VRFs and overlay
+  networks (create, delete, attach, detach, deploy) and a fabric's recalculate and deploy.
+  **Another write tool is asked for explicitly — never added as part of another change.**
+  Policies, interfaces, templates, discovery, credentials, bulk and import routes stay out.
+- **Every controller route not declared is unreachable.** NDFC documents 455 GET and 385 write
+  operations; this server reaches sixteen (the fourteen read tools, and the next-free-id lookup
+  each of the two create tools makes) and ten. `EXCLUDED_ENDPOINTS` records the reads
+  deliberately left out, each with a reason. A new tool needs: the endpoint in the spec (the
+  harness checks), a strict `inputSchema`, its annotations, redaction decided, a harness check
+  for its request and its result, and a run against a controller.
+- **A write error says whether anything changed.** `writeGuidanceFor` in `tools.mjs`: a refusal
+  before or by the controller says nothing was changed; a timeout or a cut connection after the
+  request left is `write_outcome_unknown` and says read the state first; a 5xx says the outcome
+  is unknown. An attach answers HTTP 200 with a verdict per switch: anything but `SUCCESS` is
+  an error result. A write answer is never passed through whole (it can carry configuration):
+  only its `status` or `message` sentence.
+- **The role is checked before the arguments**, so a reader learns nothing about what a write
+  accepts. Roles: `read` < `write` < `admin`. Local mode: the one caller holds the ceiling.
+  Gateway mode: a person's role is their grant by e-mail address (`grants.json` under
+  `NDFC_MCP_DATA_DIR`), no grant means `read`, and `NDFC_MCP_ADMIN_EMAILS` are always admin.
+  A grants file that cannot be read suspends every grant; a grant that cannot be stored is
+  refused, never held in memory. Grant settings where no grant is read stop the server at start.
+- **Every change is logged with its arguments** (`access=write args=…`); reads are logged as
+  before. Write arguments are names and numbers, which is what makes logging them safe.
 - **Secrets stay on the controller.** Measured on the lab: a policy's `generatedConfig` and a
   deployment's command list carry local-user password hashes. Neither field is ever copied into
   a result. Fabric settings are redacted by key name; free-form CLI settings are omitted whole.
@@ -99,6 +129,63 @@ There is no linter and no package.json. The harness is the gate.
 - A number in `README.md` or here (checks, tools, operations) is a claim: re-measure before
   changing it.
 - Do not add an npm dependency without asking. The zero-dependency server is deliberate.
+
+## State (2026-11-14): write access, 0.3.0
+
+Built and verified against a new reservation of the same sandbox, reached from the host through
+a SOCKS proxy and a local port forward (the host's own VPN client held another network):
+
+- Harness 294/294. Two guards were broken on purpose to see it fail: a role check that lets
+  everyone write (5 checks failed), and `send()` without its write list (7 failed).
+- `live-check.mjs`: read-only 29/29 with the CA pinned and no write sent; `--write` all passing —
+  a reader refused, an administrator's grant, `create_vrf`, `create_network`, the attachment
+  reads, the controller's refusals (duplicate, a VRF with a network, a spine), both deletes,
+  the same VRFs and networks afterwards, and the revoke.
+- Called through the real server in local mode: `attach_network`, `detach_network` (whole and
+  ports only), `detach_vrf`, `recalculate_fabric_config` ("Config save is completed"),
+  `deploy_network`, `delete_network`.
+- The image built from this tree, run as `compose.direct.yaml` declares it (read-only
+  filesystem, no capabilities, 127.0.0.1 only): 26 tools, a create and a delete over HTTP and
+  over the stdio bridge, `/data` writable by the server's user.
+- `./setup --yes` in scratch copies, old and new side by side: identical output, `.env` and aimo
+  entry in read mode; with `NDFC_MCP_ACCESS=write` it keeps the line and writes the other
+  description.
+
+**Not verified:** a deployment that succeeds — the sandbox's switches were still booting (one
+spine reachable, no leaf), so `deploy_*` timed out and `--deploy` skipped itself; the answer of
+a successful `deploy_vrf`, `deploy_network` and `deploy_fabric_config` is from Cisco's API
+document. No MCP client was driven with the write tools. Gateway mode ran only against
+assertions the tests signed. Nothing of this was run on Windows.
+
+What the lab taught, kept because the document does not say it:
+
+- v2 `vrfs` / `networks` take `vrfTemplateConfig` / `networkTemplateConfig` as an OBJECT and
+  fill every setting not sent. `vrfinfo` / `netinfo` propose the next free VNI.
+- An attachment needs `vlan`: missing, it is a NullPointerException inside an HTTP 200; `0`
+  lets the controller choose. A network attachment takes the network's VLAN when none is sent.
+- Taking ports out of a network needs `switchPorts: ""` beside `detachSwitchPorts`; without it
+  the controller answers 500 with a NullPointerException.
+- The v2 GET of VRF attachments returns a list of lists; the v1 GET returns the documented
+  shape. The read tools use v1.
+- Refusals are HTTP 400 `{Error, message}` with tabs inside the message; recalculate refuses
+  with one plain sentence and HTTP 500 while a switch is unreachable.
+- With a switch unreachable, a deployment does not answer within 60 s, and an object that was
+  ever attached cannot be deleted: its detach stays `PENDING` until a deployment succeeds.
+  **`MCP_TEST_VRF` and `MCP_TEST_NET` were left on that reservation in this state.**
+
+**The sandbox gateway holds ONE session per VPN login** (seen 2026-11-14): a second client that
+logs in with the same account is given the same address, and one of the two is ended with
+`Received server disconnect: b0 'Internal Error'` about 13 s later. A sidecar retries every
+10 s, so two clients on one login knock each other off for as long as both run. Before starting
+the stack, stop every other client of that login (another checkout's stack, a host VPN client).
+
+**`VPN_MODE=proxy` in the sidecar is built, not finished** (same day, for a place that gives a
+container no capability, such as a Kubernetes pod): OpenConnect with `--script-tun` and
+`ocproxy`, one `VPN_FORWARDS` port on 127.0.0.1, no interface and no route. Run as uid 10001
+with every capability dropped and a read-only filesystem it logged in and one request through
+the forward answered 200. Whether it holds a session is NOT known: every run was ended after
+13 s by the one-session rule above, because this checkout's own stack was up on the same login.
+Not in the README, not in a compose file, default unchanged (`tunnel`).
 
 ## State (2026-11-12)
 
@@ -154,12 +241,13 @@ whether Docker is not answering or the tunnel did not come up, shows the sidecar
 and stops it instead of leaving it to retry a refused login.
 
 **Not verified:** on Windows, a tunnel that comes up (and so a real controller, and `setup`'s
-CA pin), and a real `claude` CLI; macOS itself after
-the Windows change (Linux stood in for it); a gateway other than the sandbox's (a second
-factor, a private gateway certificate, another protocol); Claude Desktop; the aimo VS Code
-extension (the configuration follows its documented `aimo.mcp.local.servers` format, and the
-server speaks the protocol revision it uses, 2025-06-18). `list_vrfs` / `list_networks` have
-only seen empty lists.
+CA pin), and a real `claude` CLI; a gateway other than the sandbox's (a second
+factor, a private gateway certificate, another protocol); Claude Desktop.
+
+Closed since this section was written: the aimo VS Code extension called the server later the
+same day (stdio, as `own_ndfc`: one question, `list_switches` and `get_fabric_overview`);
+`setup` and `bin/client-config` ran on macOS itself on 2026-11-14, and `list_vrfs` /
+`list_networks` returned a VRF and a network that day (the section above).
 
 Seen under Podman and left alone: with the controller unreachable and `NDFC_TIMEOUT_MS=4000`,
 `get_controller_info` took 134 s and then 34 s to answer `upstream_unreachable`, though a bare

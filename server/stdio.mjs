@@ -53,7 +53,8 @@ async function relay(line) {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json", "X-Api-Key": KEY },
       body: line,
-      signal: AbortSignal.timeout(120_000),
+      // Longer than the longest a write may wait for the controller (NDFC_WRITE_TIMEOUT_MS, at most 300 s).
+      signal: AbortSignal.timeout(330_000),
     });
     const text = await res.text();
     if (!text.trim()) return; // a notification: 202, nothing to say

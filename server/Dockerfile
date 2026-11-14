@@ -1,12 +1,16 @@
-# ndfc-mcp — read-only Nexus Dashboard Fabric Controller tools. No npm
-# dependencies: the controller is plain JSON over node:https.
-#   server.mjs  MCP over HTTP          auth.mjs  API key (+ gateway assertions)
-#   stdio.mjs   MCP over stdin/stdout  ndfc.mjs  the GET-only controller client
-#   pin-ca.mjs  prints NDFC_TLS_CA_PEM tools.mjs the twelve tools and their rules
+# ndfc-mcp — Nexus Dashboard Fabric Controller tools: read-only unless
+# NDFC_MCP_ACCESS=write. No npm dependencies: the controller is plain JSON over
+# node:https.
+#   server.mjs  MCP over HTTP          auth.mjs   API key (+ gateway assertions)
+#   stdio.mjs   MCP over stdin/stdout  ndfc.mjs   the controller client (declared endpoints only)
+#   pin-ca.mjs  prints NDFC_TLS_CA_PEM tools.mjs  the tools and their rules
+#                                      grants.mjs who may write (roles, the grant tools)
 FROM node:22-bookworm-slim
 
-RUN useradd -u 10001 -m ndfc && mkdir -p /app && chown -R ndfc /app
-COPY server.mjs auth.mjs ndfc.mjs tools.mjs stdio.mjs pin-ca.mjs /app/
+# /data keeps the grants of a gateway-mode server (NDFC_MCP_DATA_DIR=/data,
+# a volume in the compose files). Nothing is written there otherwise.
+RUN useradd -u 10001 -m ndfc && mkdir -p /app /data && chown -R ndfc /app /data
+COPY server.mjs auth.mjs ndfc.mjs tools.mjs grants.mjs stdio.mjs pin-ca.mjs /app/
 
 USER ndfc
 ENV NDFC_MCP_PORT=3300 NODE_ENV=production

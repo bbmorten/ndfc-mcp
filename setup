@@ -33,6 +33,8 @@ const WINDOWS = process.platform === "win32";
 const SELF = WINDOWS ? ".\\setup" : "./setup"; // how this script is started, for the messages
 const SERVER = "ndfc";
 const DESCRIPTION = "Read-only Cisco NDFC: fabrics, switches, interfaces, links, policies, alarms";
+// What a client shows for a server that was set up with write access.
+const DESCRIPTION_WRITE = "Cisco NDFC: reads fabrics, switches, interfaces, links, policies, alarms; creates, attaches and deploys VRFs and networks";
 
 if (ARGS.has("--help") || ARGS.has("-h")) {
   const help = fs.readFileSync(__filename, "utf8").split(/\r?\n/).slice(2, 16).map((l) => l.replace(/^ \*\/?\s?/, "")).join("\n");
@@ -217,7 +219,7 @@ function quoteEnv(value) {
 }
 
 const ENV_LAYOUT = [
-  ["# The MCP server — the key every client sends, and the port on this machine (127.0.0.1 only).", ["NDFC_MCP_API_KEY", "NDFC_MCP_HOST_PORT", "NDFC_MCP_MODE"]],
+  ["# The MCP server — the key every client sends, and the port on this machine (127.0.0.1 only).", ["NDFC_MCP_API_KEY", "NDFC_MCP_HOST_PORT", "NDFC_MCP_MODE", "NDFC_MCP_ACCESS"]],
   ["# The controller and the account the server reads it with.", ["NDFC_URL", "NDFC_USERNAME", "NDFC_PASSWORD", "NDFC_LOGIN_DOMAIN"]],
   ["# TLS to the controller: a pinned CA, or (a lab only) no verification.", ["NDFC_TLS_CA_PEM", "NDFC_TLS_INSECURE"]],
   ["# The VPN sidecar (compose.yaml only; compose.direct.yaml ignores these).", ["VPN_SERVER", "VPN_USERNAME", "VPN_PASSWORD", "VPN_PROTOCOL", "VPN_AUTHGROUP", "VPN_SERVERCERT", "VPN_EXTRA_ARGS", "VPN_HEALTH_URL"]],
@@ -579,7 +581,7 @@ async function main() {
     },
   });
   v.NDFC_URL = new URL(v.NDFC_URL).origin;
-  v.NDFC_USERNAME = await ask("Controller username", D.NDFC_USERNAME, { hint: "a read-only account is enough" });
+  v.NDFC_USERNAME = await ask("Controller username", D.NDFC_USERNAME, { hint: "a read-only account is enough unless the server is given write access" });
   v.NDFC_PASSWORD = await ask("Controller password", D.NDFC_PASSWORD, { secret: true });
   const tlsDefault = D.NDFC_TLS_CA_PEM ? "pin" : /^(1|true|yes)$/i.test(D.NDFC_TLS_INSECURE || "") ? "insecure" : "verify";
   const tls = await choose("The controller's certificate:", [
@@ -612,6 +614,15 @@ async function main() {
   });
   if (port === "3300") delete v.NDFC_MCP_HOST_PORT;
   else v.NDFC_MCP_HOST_PORT = port;
+  // Read-only is the default and writes nothing to .env; write access is asked for.
+  const access = await choose("What may the server do on the controller?", [
+    { key: "read", label: "Read only", note: "the write tools are not offered, and the server cannot send a change" },
+    { key: "write", label: "Read and write", note: "also creates, attaches, deploys and deletes VRFs and networks — deploying configures switches" },
+  ], D.NDFC_MCP_ACCESS === "write" ? "write" : "read");
+  if (access === "write") {
+    v.NDFC_MCP_ACCESS = "write";
+    warn("write access: anyone who can reach this server with its key can change the controller. The controller account needs a role that may write (network-admin).");
+  } else delete v.NDFC_MCP_ACCESS;
   let start = false;
   if (docker) start = await yesno(`Build and start the containers now (${path.basename(composeFile)})?`, true);
   else warn("docker is not on PATH: the containers cannot be started from here, the clients can still be configured");
@@ -800,8 +811,8 @@ async function main() {
     const { file, transport } = clients.aimo;
     const entry =
       transport === "stdio"
-        ? { type: "stdio", ...stdioEntry, description: DESCRIPTION }
-        : { type: "http", url, headers: { "X-Api-Key": "${secret:ndfc-api-key}" }, description: DESCRIPTION };
+        ? { type: "stdio", ...stdioEntry, description: access === "write" ? DESCRIPTION_WRITE : DESCRIPTION }
+        : { type: "http", url, headers: { "X-Api-Key": "${secret:ndfc-api-key}" }, description: access === "write" ? DESCRIPTION_WRITE : DESCRIPTION };
     try {
       let text = "";
       try {

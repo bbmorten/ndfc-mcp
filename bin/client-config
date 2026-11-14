@@ -35,16 +35,21 @@ function findExe(name) {
   return null;
 }
 
-/** NDFC_MCP_HOST_PORT from .env, when there is one. Nothing else is read from it. */
-function hostPort() {
+/** One setting from .env, when there is one. Only the port and the access level are read from it. */
+function envValue(name) {
   let text = "";
   try {
     text = fs.readFileSync(ENV, "utf8");
   } catch {}
-  const m = /^NDFC_MCP_HOST_PORT=(.*)$/m.exec(text);
-  const value = m ? m[1].trim().replace(/^(['"])(.*)\1$/, "$2") : "";
-  return value || "3300";
+  const m = new RegExp(`^${name}=(.*)$`, "m").exec(text);
+  return m ? m[1].trim().replace(/^(['"])(.*)\1$/, "$2") : "";
 }
+const hostPort = () => envValue("NDFC_MCP_HOST_PORT") || "3300";
+// What a client shows for the server: the write tools are named when .env turns them on.
+const DESCRIPTION =
+  envValue("NDFC_MCP_ACCESS") === "write"
+    ? "Cisco NDFC: reads fabrics, switches, interfaces, links, policies, alarms; creates, attaches and deploys VRFs and networks"
+    : "Read-only Cisco NDFC: fabrics, switches, interfaces, links, policies, alarms";
 
 const DOCKER = findExe("docker") || "docker";
 const PORT = hostPort();
@@ -94,7 +99,7 @@ ${RULE}
     "type": "stdio",
     "command": "docker",
     "args": ${stdioArgs},
-    "description": "Read-only Cisco NDFC: fabrics, switches, interfaces, links, policies, alarms"
+    "description": ${json(DESCRIPTION)}
   }
 }
 
@@ -107,7 +112,7 @@ ${RULE}
     "type": "http",
     "url": "http://127.0.0.1:${PORT}/mcp",
     "headers": { "X-Api-Key": "\${secret:ndfc-api-key}" },
-    "description": "Read-only Cisco NDFC: fabrics, switches, interfaces, links, policies, alarms"
+    "description": ${json(DESCRIPTION)}
   }
 }
   Then: Command Palette → "AIMO: Set Local Server Secret" → id  ndfc-api-key

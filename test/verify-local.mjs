@@ -5,10 +5,11 @@
  *
  *   node test/verify-local.mjs
  *
- * The stub answers the controller's login and the twelve read endpoints with
- * rows shaped like the ones captured from the DevNet sandbox (NDFC 12.2.2,
- * 2026-11-11), plus the planted secrets that must never come out the other
- * side. Keys and secrets are generated here, per run.
+ * The stub answers the controller's login, the read endpoints with rows shaped
+ * like the ones captured from the DevNet sandbox (NDFC 12.2.2, 2026-11-11),
+ * and the write endpoints with the answers measured there on 2026-11-14 —
+ * plus the planted secrets that must never come out the other side. Keys and
+ * secrets are generated here, per run.
  *
  * Exits non-zero on any failed check. It asserts no tool COUNT anywhere: the
  * declarations are checked for what each one must be, so adding a tool does
@@ -18,13 +19,15 @@ import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import zlib from "node:zlib";
 
+import { GRANT_TOOLS, roleAllows } from "../server/grants.mjs";
 import { createNdfcClient, matchesEndpoint } from "../server/ndfc.mjs";
-import { createServer, loadConfig } from "../server/server.mjs";
-import { API_BASE_PATH, EXCLUDED_ENDPOINTS, TOOLS, ToolError, pathFor, redactSetting } from "../server/tools.mjs";
+import { createServer, loadConfig, offeredTools } from "../server/server.mjs";
+import { API_BASE_PATH, EXCLUDED_ENDPOINTS, READ_TOOLS, TOOLS, ToolError, WRITE_ENDPOINTS, WRITE_TOOLS, endpointsOf, pathFor, redactSetting } from "../server/tools.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -135,8 +138,60 @@ const FIXTURES = {
         { command: "interface ethernet1/18", cliResp: "% Invalid", strStatus: i === 3 ? "FAILED" : "SUCCESS", status: i === 3 ? "FAILED" : "SUCCESS" },
       ],
     })),
+  "/lan-fabric/rest/top-down/fabrics/DevNet_Fabric/vrfs/attachments": (hit) =>
+    [
+      { vrfName: "Tenant_A", lanAttachList: [
+        { vrfName: "Tenant_A", switchName: "leaf1", lanAttachState: "DEPLOYED", isLanAttached: true, switchSerialNo: "960FWK7XGJP", peerSerialNo: null, switchRole: "leaf", fabricName: "DevNet_Fabric", ipAddress: "10.10.20.173", instanceValues: JSON.stringify({ deviceSupportL3VniNoVlan: "false", bgpPassword: VRF_PASSWORD }), vlanId: 2001, vrfId: 50001, entityName: "Tenant_A" },
+        { vrfName: "Tenant_A", switchName: "leaf3", lanAttachState: "NA", isLanAttached: false, switchSerialNo: "95O9ZSQBU78", peerSerialNo: null, switchRole: "border", fabricName: "DevNet_Fabric", ipAddress: "10.10.20.175", instanceValues: null, vlanId: null, vrfId: 50001, entityName: null },
+      ] },
+      { vrfName: "Tenant_B", lanAttachList: [] },
+    ].filter((v) => !hit.query["vrf-names"] || v.vrfName === hit.query["vrf-names"]),
+  "/lan-fabric/rest/top-down/fabrics/DevNet_Fabric/networks/attachments": () => [
+    { networkName: "Web", lanAttachList: [
+      { networkName: "Web", displayName: "Web", switchName: "leaf1", switchRole: "leaf", fabricName: "DevNet_Fabric", lanAttachState: "PENDING", isLanAttached: true, portNames: "Ethernet1/5,Ethernet1/6", switchSerialNo: "960FWK7XGJP", peerSerialNo: null, switchDbId: 27420, ipAddress: "10.10.20.173", networkId: 30001, vlanId: 2301, instanceValues: '{"isVPC":"false"}', freeformConfig: `key ${AAA_KEY}`, entityName: "Web", interfaceGroups: null },
+    ] },
+  ],
+  "/lan-fabric/rest/top-down/v2/fabrics/DevNet_Fabric/vrfinfo": () => ({ l3vni: 50002, "vrf-prefix": "MyVRF_" }),
+  "/lan-fabric/rest/top-down/v2/fabrics/DevNet_Fabric/netinfo": () => ({ mcastip: "239.1.1.1", l2vni: 30002, "network-prefix": "MyNetwork_" }),
   // Excluded endpoints: reachable on the controller, never by this server.
   "/lan-fabric/rest/lanConfig/getLanSwitchCredentials": () => [{ switchName: "leaf1", userName: "admin", password: SWITCH_CRED }],
+};
+
+// The controller's answers to a write, as measured on the lab (NDFC 12.2.2,
+// 2026-11-14): a refusal is HTTP 400 with {Error, message}; an attach answers
+// 200 with one verdict per switch; recalculate refuses in one plain sentence.
+const refusal = (rel, message) => ({ status: 400, body: { path: `/rest${rel.replace("/lan-fabric/rest", "")}`, Error: "Bad Request Error", message, timestamp: "2026-11-14 12:59:28.426", status: "400" } });
+const TD = "/lan-fabric/rest/top-down/v2/fabrics/DevNet_Fabric";
+const attachVerdict = (kind) => (hit) => {
+  const row = JSON.parse(hit.body)[0];
+  const item = row.lanAttachList[0];
+  const name = row[kind];
+  if (name === "No_Such") return refusal(hit.rel, kind === "vrfName" ? "Invalid VRF" : "Invalid Network");
+  if (item.serialNumber === "ZZZZ99999") return refusal(hit.rel, "Invalid Switch Serial Number");
+  if (item.serialNumber === "99F2O2W6J0B") return { status: 200, body: { [`${name}-[99F2O2W6J0B/spine1]`]: "Failed : VRF Attachment not supported for SPINE device 99F2O2W6J0B" } };
+  return { status: 200, body: { [`${name}-[${item.serialNumber}/leaf1]`]: "SUCCESS" } };
+};
+const WRITES = {
+  [`POST ${TD}/vrfs`]: (hit) => {
+    const b = JSON.parse(hit.body);
+    return b.vrfName === "Tenant_A" ? refusal(hit.rel, "VRF\tTenant_A\talready exists") : { status: 200, body: { "VRF Id": b.vrfId, "VRF Name": b.vrfName } };
+  },
+  [`POST ${TD}/networks`]: (hit) => {
+    const b = JSON.parse(hit.body);
+    return { status: 200, body: { "Network Id": b.networkId, "Network Name": b.networkName } };
+  },
+  [`DELETE ${TD}/vrfs/Tenant_A`]: (hit) => refusal(hit.rel, "Delete all networks of\tTenant_A\tbefore deleting the vrf"),
+  [`DELETE ${TD}/vrfs/Tenant_B`]: () => ({ status: 200, body: "VRF(s) deleted successfully" }),
+  [`DELETE ${TD}/vrfs/No_Such`]: (hit) => refusal(hit.rel, "Invalid VRF"),
+  [`DELETE ${TD}/networks/Web`]: (hit) => refusal(hit.rel, "Delete is not allowed as the Network is under a Deployment operation"),
+  [`DELETE ${TD}/networks/Old`]: () => ({ status: 200, body: "" }),
+  [`POST ${TD}/vrfs/attachments`]: attachVerdict("vrfName"),
+  [`POST ${TD}/networks/attachments`]: attachVerdict("networkName"),
+  [`POST ${TD}/vrfs/deployments`]: () => ({ status: 200, body: { status: "Deployment of VRF(s) has been initiated successfully" } }),
+  [`POST ${TD}/networks/deployments`]: () => ({ status: 200, body: { status: "Deployment of Network(s) has been initiated successfully", generatedConfig: `username admin password 5 ${USER_HASH}` } }),
+  "POST /lan-fabric/rest/control/fabrics/DevNet_Fabric/config-save": () => ({ status: 200, body: { status: "Config save is completed" } }),
+  "POST /lan-fabric/rest/control/fabrics/External_Fabric/config-save": () => ({ status: 500, body: "Switch(es) are either reloading or not reachable, please ensure switches are reachable and then retry Recalculate Config" }),
+  "POST /lan-fabric/rest/control/fabrics/DevNet_Fabric/config-deploy": () => ({ status: 200, body: { status: "Configuration deployment completed." } }),
 };
 
 const stubServer = http.createServer((req, res) => {
@@ -161,8 +216,21 @@ const stubServer = http.createServer((req, res) => {
     if (!url.pathname.startsWith(`${API_BASE_PATH}/`)) return reply(404, { error: "outside the NDFC API" });
     if (!stub.issued.includes(String(hit.authorization).replace(/^Bearer /, ""))) return reply(401, { error: "Unauthorized" });
     const rel = url.pathname.slice(API_BASE_PATH.length);
+    hit.rel = rel;
     const route = stub.routes[rel];
-    const out = route ? route(hit) : FIXTURES[rel] ? { status: 200, body: FIXTURES[rel](hit) } : { status: 404, body: { timestamp: 1, status: 404, error: "Not Found", path: rel } };
+    const write = WRITES[`${req.method} ${rel}`];
+    // A fixture is what a GET returns. Any other method on a path with no
+    // write route is the controller's 405, so a write that lands on a read
+    // route can never look like a success.
+    const out = route
+      ? route(hit)
+      : req.method === "GET" && FIXTURES[rel]
+        ? { status: 200, body: FIXTURES[rel](hit) }
+        : write
+          ? write(hit)
+          : req.method === "GET"
+            ? { status: 404, body: { timestamp: 1, status: 404, error: "Not Found", path: rel } }
+            : { status: 405, body: { timestamp: 1, status: 405, error: "Method Not Allowed", path: rel } };
     setTimeout(() => reply(out.status, out.body, out.headers), out.delayMs || 0);
   });
 });
@@ -194,11 +262,12 @@ const BASE_ENV = {
 
 const servers = [];
 const unexpected = []; // exceptions the server logged instead of showing
-async function start(envOverrides = {}, deps = {}) {
+async function start(envOverrides = {}, deps = {}, tune = () => {}) {
   const env = { ...BASE_ENV, ...envOverrides };
   for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
   const { config, missing } = loadConfig(env);
   if (missing.length) throw new Error(`harness config: ${missing.join("; ")}`);
+  tune(config); // a timeout shorter than configuration allows, so a timeout test does not take a minute
   const logs = [];
   // The harness makes hundreds of calls as one person: the limiter gets its own
   // section (and its own server) below, and is out of the way everywhere else.
@@ -254,36 +323,65 @@ async function call(base, name, args = {}, opts = {}) {
   return { ...r, isError: result?.isError === true, data, bytes: Buffer.byteLength(r.text) };
 }
 const dataHits = () => stub.hits.filter((h) => h.path !== "/login").length;
+const writeHits = () => stub.hits.filter((h) => h.path !== "/login" && h.method !== "GET");
+const tmpDirs = [];
+const tmpDir = () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "ndfc-mcp-harness-"));
+  tmpDirs.push(d);
+  return d;
+};
 
 try {
   const S = await start();
 
   // ───────────────────────── declarations ─────────────────────────
   section("declarations");
+  const EVERY = [...TOOLS, ...GRANT_TOOLS];
   const names = TOOLS.map((t) => t.name);
-  check("tool names are unique", new Set(names).size === names.length);
-  check("every tool name fits the gateway prefix (mcp__ndfc__<name> within 64 characters)", names.every((n) => `mcp__ndfc__${n}`.length <= 64 && /^[a-z][a-z0-9_]+$/.test(n)));
-  check("every tool declares exactly one GET endpoint", TOOLS.every((t) => /^GET \/\S+$/.test(t.endpoint)));
-  check("every tool is annotated read-only and closed-world", TOOLS.every((t) => t.annotations?.readOnlyHint === true && t.annotations?.openWorldHint === false));
-  check("every input schema is a strict object", TOOLS.every((t) => t.inputSchema.type === "object" && t.inputSchema.additionalProperties === false));
-  check("no tool takes an identity or privilege argument", TOOLS.every((t) => !Object.keys(t.inputSchema.properties || {}).some((k) => /^(user|asUser|username|role$|tenant|actor|password|token)/i.test(k) && !(k === "role" && t.name === "list_switches"))));
-  const QUERY_ARGS = { "GET /lan-fabric/rest/interface/detail": ["serialNumber"] };
+  const props = (t) => t.inputSchema.properties || {};
+  check("tool names are unique, grant tools included", new Set(EVERY.map((t) => t.name)).size === EVERY.length);
+  check("every tool name fits the gateway prefix (mcp__ndfc__<name> within 64 characters)", EVERY.every((t) => `mcp__ndfc__${t.name}`.length <= 64 && /^[a-z][a-z0-9_]+$/.test(t.name)));
+  check("every tool is a read tool or a write tool, and both kinds exist", READ_TOOLS.length > 0 && WRITE_TOOLS.length > 0 && READ_TOOLS.length + WRITE_TOOLS.length === TOOLS.length);
+  check("every read tool declares exactly one GET endpoint and no other", READ_TOOLS.every((t) => /^GET \/\S+$/.test(t.endpoint) && t.also === undefined));
+  check("every read tool is annotated read-only and closed-world", READ_TOOLS.every((t) => t.annotations?.readOnlyHint === true && t.annotations?.openWorldHint === false));
+  check("every write tool declares exactly one POST, PUT or DELETE, and reads only through GETs it declared", WRITE_TOOLS.every((t) => /^(POST|PUT|DELETE) \/\S+$/.test(t.endpoint) && (t.also || []).every((e) => /^GET \/\S+$/.test(e))));
+  check("every write tool is annotated as a write, closed-world, and says whether it is destructive and idempotent", WRITE_TOOLS.every((t) => t.annotations?.readOnlyHint === false && t.annotations?.openWorldHint === false && typeof t.annotations?.destructiveHint === "boolean" && typeof t.annotations?.idempotentHint === "boolean"));
+  const mustBeDestructive = WRITE_TOOLS.filter((t) => /^(delete|detach|deploy)_/.test(t.name));
+  check("every tool that deletes, detaches or deploys is marked destructive", mustBeDestructive.length >= 6 && mustBeDestructive.every((t) => t.annotations.destructiveHint === true));
+  check("a write tool's description starts with WRITE; a tool that deploys says it configures switches", WRITE_TOOLS.every((t) => /^WRITE\b/.test(t.description)) && WRITE_TOOLS.filter((t) => /^deploy_/.test(t.name)).every((t) => /CONFIGURES/.test(t.description)));
+  check("every input schema is a strict object", EVERY.every((t) => t.inputSchema.type === "object" && t.inputSchema.additionalProperties === false));
+  check("no controller tool takes an identity, privilege or credential argument", TOOLS.every((t) => !Object.keys(props(t)).some((k) => /^(user|asUser|username|role$|tenant|actor|email)|password|token|secret|credential/i.test(k) && !(k === "role" && t.name === "list_switches"))));
+  check("no write tool takes configuration text, a template name or a raw body", WRITE_TOOLS.every((t) => !Object.keys(props(t)).some((k) => /config|freeform|template|body|payload|command|cli|extension|instance/i.test(k))));
+  check("every string argument of a write tool is held to a pattern or an enum", WRITE_TOOLS.every((t) => Object.values(props(t)).every((p) => p.type !== "string" || typeof p.pattern === "string" || Array.isArray(p.enum))));
+  const hostile = ["a\nb", "a\rb", 'say "x"', "it's", "x ; reload", "x | y", "x`id`", "$(id)", "x!y", "x\\y", "x\ty", "é", ""];
+  const writePatterns = [...new Set(WRITE_TOOLS.flatMap((t) => Object.values(props(t)).filter((p) => p.pattern).map((p) => p.pattern)))];
+  check("no pattern of a write argument admits a newline, a quote, a command separator or shell syntax", writePatterns.length > 5 && writePatterns.every((p) => hostile.every((h) => !new RegExp(p, "u").test(h))), writePatterns.filter((p) => hostile.some((h) => new RegExp(p, "u").test(h))).join(" "));
+  const QUERY_ARGS = { "GET /lan-fabric/rest/interface/detail": { serialNumber: "serialNumber" } };
+  const queryOf = (t) => ({ ...(QUERY_ARGS[t.endpoint] || {}), ...(t.query || {}) });
   check(
     "every argument is a path parameter, a declared query parameter, or consumed by this server (argMap null)",
     TOOLS.every((t) => {
       const pathParams = [...t.endpoint.matchAll(/\{([^}]+)\}/g)].map((m) => m[1]);
-      return Object.keys(t.inputSchema.properties || {}).every((k) => pathParams.includes(k) || (QUERY_ARGS[t.endpoint] || []).includes(k) || (t.argMap && t.argMap[k] === null));
+      return Object.keys(props(t)).every((k) => pathParams.includes(k) || Object.hasOwn(queryOf(t), k) || (t.argMap && t.argMap[k] === null));
     })
   );
-  check("every description is substantial and promises no write", TOOLS.every((t) => t.description.length > 80 && !/\b(creates?|deletes?|deploys? a|updates?|modif(y|ies))\b/i.test(t.description.replace(/controller deployed|was deployed|deployed to|deployed configuration/gi, ""))));
+  check("every read tool's description is substantial and promises no write", READ_TOOLS.every((t) => t.description.length > 80 && !/\b(creates?|deletes?|deploys? a|updates?|modif(y|ies))\b/i.test(t.description.replace(/controller deployed|was deployed|deployed to|deployed configuration/gi, ""))));
+  check("every write and grant tool's description is substantial", [...WRITE_TOOLS, ...GRANT_TOOLS].every((t) => t.description.length > 120));
+  check("the grant tools touch no controller endpoint and need the admin role", GRANT_TOOLS.length === 3 && GRANT_TOOLS.every((t) => t.endpoint === undefined && t.access === "admin"));
+  check("roles are ordered read < write < admin, and an unknown role allows nothing", roleAllows("admin", "write") && roleAllows("write", "read") && !roleAllows("read", "write") && !roleAllows("write", "admin") && !roleAllows(undefined, "read") && !roleAllows("root", "read"));
   check("no tool endpoint is also excluded", TOOLS.every((t) => !Object.hasOwn(EXCLUDED_ENDPOINTS, t.endpoint)));
   check("every exclusion is a GET with a reason", Object.entries(EXCLUDED_ENDPOINTS).every(([k, v]) => /^GET \/\S+$/.test(k) && String(v).trim().length > 20));
   check("the switch-credentials endpoint is excluded by name", /credential/i.test(EXCLUDED_ENDPOINTS["GET /lan-fabric/rest/lanConfig/getLanSwitchCredentials"] || ""));
   const ndfcSource = fs.readFileSync(path.join(HERE, "..", "server", "ndfc.mjs"), "utf8");
-  check("the controller client makes exactly one POST (the login) and no PUT/PATCH/DELETE", (ndfcSource.match(/request\("POST"/g) || []).length === 1 && !/request\("(PUT|PATCH|DELETE)"/.test(ndfcSource) && /request\("POST", LOGIN_PATH/.test(ndfcSource));
+  check(
+    "the controller client names a method in three places only: the login POST, the GET of get(), and the declared method of send()",
+    (ndfcSource.match(/await request\(/g) || []).length === 3 &&
+      /request\("POST", LOGIN_PATH/.test(ndfcSource) && /request\("GET", target/.test(ndfcSource) && /request\(method, target/.test(ndfcSource) && !/request\("(PUT|PATCH|DELETE)"/.test(ndfcSource)
+  );
+  check("send() checks its endpoint against the client's write list before anything else leaves", /if \(!allowedWrites\.has\(String\(endpoint\)\)\) throw/.test(ndfcSource) && ndfcSource.indexOf("allowedWrites.has(String(endpoint))") < ndfcSource.indexOf("request(method, target"));
   const listed = (await rpc(S.base, "tools/list")).json.result.tools;
-  check("tools/list sends only the public fields (no handler, endpoint or argMap)", listed.every((t) => Object.keys(t).sort().join() === "annotations,description,inputSchema,name,title"));
-  check("tools/list is the declared list, in order", listed.map((t) => t.name).join() === names.join());
+  check("tools/list sends only the public fields (no handler, endpoint, access or argMap)", listed.every((t) => Object.keys(t).sort().join() === "annotations,description,inputSchema,name,title"));
+  check("tools/list of a server left at its default is the read tools, in order, and nothing else", listed.map((t) => t.name).join() === READ_TOOLS.map((t) => t.name).join() && offeredTools(S.config).length === READ_TOOLS.length);
 
   // ───────────────────────── the vendor's API document ─────────────────────────
   // spec/nd-fabric-controller-lan-1222.json.gz is Cisco's OpenAPI document for
@@ -304,15 +402,10 @@ try {
     for (const m of ["get", "post", "put", "delete", "patch"]) if (item[m]) documented.set(`${m.toUpperCase()} ${normPath(p)}`, item[m]);
   }
   const specKey = (endpoint) => `${endpoint.split(" ")[0]} ${normPath(endpoint.split(" ")[1])}`;
-  const undocumentedTools = TOOLS.filter((t) => !documented.has(specKey(t.endpoint))).map((t) => t.name);
-  check("every tool endpoint is a documented GET operation", undocumentedTools.length === 0, undocumentedTools.join(" "));
-  check(
-    "every query parameter a tool sends is documented for its operation",
-    TOOLS.every((t) => {
-      const q = (documented.get(specKey(t.endpoint))?.parameters || []).filter((p) => p.in === "query").map((p) => p.name);
-      return (QUERY_ARGS[t.endpoint] || []).every((a) => q.includes(a));
-    })
-  );
+  const undocumentedTools = TOOLS.filter((t) => !endpointsOf(t).every((e) => documented.has(specKey(e)))).map((t) => t.name);
+  check("every endpoint a tool declares is a documented operation with that method", undocumentedTools.length === 0, undocumentedTools.join(" "));
+  const documentedQuery = (endpoint) => (documented.get(specKey(endpoint))?.parameters || []).filter((p) => p.in === "query").map((p) => p.name);
+  check("every query parameter a tool sends is documented for its operation", TOOLS.every((t) => Object.values(queryOf(t)).every((q) => documentedQuery(t.endpoint).includes(q))));
   // Three endpoints the lab controller answers that the public document does
   // not list. They are excluded like the rest; naming them here means a fourth
   // cannot join them unnoticed, and one of them is the stored switch logins.
@@ -320,7 +413,10 @@ try {
   const strayExclusions = Object.keys(EXCLUDED_ENDPOINTS).filter((e) => !documented.has(specKey(e)) && !LIVE_BUT_UNDOCUMENTED.includes(e));
   check("every exclusion is a documented GET operation, or one of the three live-but-undocumented endpoints", strayExclusions.length === 0 && LIVE_BUT_UNDOCUMENTED.every((e) => Object.hasOwn(EXCLUDED_ENDPOINTS, e) && !documented.has(specKey(e))), strayExclusions.join(" "));
   const writes = [...documented.keys()].filter((k) => !k.startsWith("GET ")).length;
-  check("the document's write operations exist and none is a tool endpoint", writes > 0 && TOOLS.every((t) => t.endpoint.startsWith("GET ")));
+  const declaredWrites = new Set(WRITE_ENDPOINTS.map(specKey));
+  check("the document has several hundred write operations; no read tool declares one, and the write tools declare a handful", writes > 300 && READ_TOOLS.every((t) => t.endpoint.startsWith("GET ")) && declaredWrites.size > 0 && declaredWrites.size <= 12 && [...declaredWrites].every((k) => documented.has(k)), `${writes} documented, ${declaredWrites.size} declared`);
+  const neverDeclared = /policies|interface|template|credential|inventory|discover|bulk|import|backup|restore|image|switches\/|fabrics$|\/fabrics\/\{\}$/;
+  check("no write tool reaches policies, interfaces, templates, credentials, inventory, bulk or import routes, or a fabric's own definition", [...declaredWrites].every((k) => !neverDeclared.test(k)), [...declaredWrites].filter((k) => neverDeclared.test(k)).join(" "));
 
   // ───────────────────────── configuration fails closed ─────────────────────────
   section("configuration fails closed");
@@ -332,6 +428,18 @@ try {
   check("an unknown mode is refused", loadConfig({ ...BASE_ENV, NDFC_MCP_MODE: "open" }).missing.join().includes("NDFC_MCP_MODE"));
   check("assertion settings left in place under local mode are refused, not silently ignored", loadConfig({ ...BASE_ENV, NDFC_MCP_MODE: "local" }).missing.join().includes("NDFC_MCP_MODE=gateway"));
   const bad = (over) => loadConfig({ ...BASE_ENV, ...over }).missing.join(" | ");
+  check("access defaults to read, in both modes", loadConfig({}).config.access.access === "read" && loadConfig(BASE_ENV).config.access.access === "read" && loadConfig(BASE_ENV).missing.length === 0);
+  check("an unknown access level is refused", bad({ NDFC_MCP_ACCESS: "admin" }).includes("NDFC_MCP_ACCESS"));
+  const gwWrite = bad({ NDFC_MCP_ACCESS: "write" });
+  check("gateway mode with write access and nobody to grant it is refused, naming both settings", gwWrite.includes("NDFC_MCP_ADMIN_EMAILS") && gwWrite.includes("NDFC_MCP_DATA_DIR"));
+  check("gateway mode with write access, administrators and a data directory is accepted", bad({ NDFC_MCP_ACCESS: "write", NDFC_MCP_ADMIN_EMAILS: "admin@example.invalid, Second@Example.invalid", NDFC_MCP_DATA_DIR: "/data" }) === "");
+  check("an administrator that is not an e-mail address is refused", bad({ NDFC_MCP_ACCESS: "write", NDFC_MCP_ADMIN_EMAILS: "admin", NDFC_MCP_DATA_DIR: "/data" }).includes("not an e-mail address"));
+  check("grant settings on a read-only server are refused, not silently ignored", bad({ NDFC_MCP_ADMIN_EMAILS: "admin@example.invalid" }).includes("NDFC_MCP_ACCESS=write") && bad({ NDFC_MCP_DATA_DIR: "/data" }).includes("NDFC_MCP_ACCESS=write"));
+  const localEnvOver = { NDFC_MCP_MODE: undefined, NDFC_MCP_SLUG: undefined, NDFC_MCP_ASSERTION_SECRET: undefined };
+  const localEnv = { ...BASE_ENV, ...localEnvOver };
+  check("local mode with write access needs nothing more", loadConfig({ ...localEnv, NDFC_MCP_ACCESS: "write" }).missing.length === 0);
+  check("grant settings in local mode are refused: the one caller's role is the access level", loadConfig({ ...localEnv, NDFC_MCP_ACCESS: "write", NDFC_MCP_ADMIN_EMAILS: "admin@example.invalid" }).missing.join().includes("local mode"));
+  check("a write timeout outside 5 s to 300 s is refused", bad({ NDFC_WRITE_TIMEOUT_MS: "1000" }).includes("NDFC_WRITE_TIMEOUT_MS") && bad({ NDFC_WRITE_TIMEOUT_MS: "900000" }).includes("NDFC_WRITE_TIMEOUT_MS") && loadConfig(BASE_ENV).config.ndfc.writeTimeoutMs === 90000);
   check("a short API key is refused", bad({ NDFC_MCP_API_KEY: "short" }).includes("NDFC_MCP_API_KEY"));
   check("HS256 and RS256 configured together are refused", bad({ NDFC_MCP_CP_URL: "http://cp:3000" }).includes("exactly one algorithm"));
   check("plain http to a non-loopback controller is refused", bad({ NDFC_URL: "http://10.10.20.60" }).includes("must be https"));
@@ -615,6 +723,264 @@ try {
   check("the call is logged as user=local", /tool=get_controller_info user=local outcome=ok/.test(LOCAL.logs.join("\n")));
   check("the same rules apply: an undeclared argument is refused", (await call(LOCAL.base, "list_fabrics", { asUser: "admin" }, { assertion: null })).data.error === "invalid_arguments");
 
+
+  // ───────────────────────── a read-only server (the default) ─────────────────────────
+  section("a read-only server (the default)");
+  const hzS = await (await fetch(`${S.base}/healthz`)).json();
+  check("/healthz says access read and counts the read tools only", hzS.access === "read" && hzS.tools === READ_TOOLS.length && hzS.grants === undefined);
+  check("its instructions promise no change and name no write tool", /No tool listed here/.test(init.instructions) && !/WRITE TOOLS|deploy_|create_/.test(init.instructions));
+  n = stub.hits.length;
+  const stillKnown = [];
+  for (const t of [...WRITE_TOOLS, ...GRANT_TOOLS]) {
+    const r = await rpc(S.base, "tools/call", { name: t.name, arguments: {} }, { assertion: hsAssertion() });
+    if (r.json?.error?.code !== -32602) stillKnown.push(t.name);
+  }
+  check("every write tool and every grant tool is an unknown tool there (-32602), and none reaches the controller", stillKnown.length === 0 && stub.hits.length === n, stillKnown.join(" "));
+  check("the same in local mode: the default serves the read tools and nothing else", (await rpc(LOCAL.base, "tools/call", { name: "create_vrf", arguments: { fabricName: "DevNet_Fabric", vrfName: "X" } })).json.error.code === -32602 && (await rpc(LOCAL.base, "tools/list")).json.result.tools.length === READ_TOOLS.length && stub.hits.length === n);
+  const roClient = createNdfcClient(S.config.ndfc, { now });
+  let roErr = null;
+  try {
+    await roClient.send(WRITE_ENDPOINTS[0], pathFor(WRITE_ENDPOINTS[0], { fabricName: "DevNet_Fabric" }), { body: {} });
+  } catch (e) {
+    roErr = e;
+  }
+  check("a client built without a write list refuses every write before any request, a declared one included", roErr instanceof ToolError && roErr.code === "write_not_allowed" && stub.hits.length === n && roClient.canWrite() === false);
+  roClient.close();
+
+  // ───────────────────────── write tools ─────────────────────────
+  section("write tools (local mode, NDFC_MCP_ACCESS=write)");
+  const W = await start({ ...localEnvOver, NDFC_MCP_ACCESS: "write" });
+  const wl = (await rpc(W.base, "tools/list")).json.result.tools;
+  check("tools/list is the read tools, then the write tools, and no grant tool", wl.map((t) => t.name).join() === [...READ_TOOLS, ...WRITE_TOOLS].map((t) => t.name).join());
+  const listedTool = (name) => wl.find((t) => t.name === name);
+  check("a write tool is listed with its annotations and nothing internal", listedTool("create_vrf").annotations.readOnlyHint === false && listedTool("create_vrf").annotations.destructiveHint === false && listedTool("delete_vrf").annotations.destructiveHint === true && wl.every((t) => Object.keys(t).sort().join() === "annotations,description,inputSchema,name,title"));
+  const winit = (await rpc(W.base, "initialize", {})).json.result;
+  check("the instructions say that write tools exist, and keep everything about reading results", /WRITE TOOLS/.test(winit.instructions) && /write_outcome_unknown/.test(winit.instructions) && /only source of truth/.test(winit.instructions));
+  const whz = await (await fetch(`${W.base}/healthz`)).json();
+  check("/healthz says access write, with no grants in local mode", whz.access === "write" && whz.tools === READ_TOOLS.length + WRITE_TOOLS.length && whz.grants === undefined);
+
+  const okWrites = []; // every successful write call: how many non-GET requests it made
+  const wr = async (name, args, base = W.base, opts = { assertion: null }) => {
+    const before = stub.hits.length;
+    const r = await call(base, name, args, opts);
+    const hits = stub.hits.slice(before).filter((h) => h.path !== "/login");
+    const writes = hits.filter((h) => h.method !== "GET");
+    if (!r.isError) okWrites.push([name, writes.length]);
+    return { ...r, hits, writes, sent: writes[0] ? { method: writes[0].method, path: writes[0].path.slice(API_BASE_PATH.length), query: writes[0].query, body: writes[0].body ? JSON.parse(writes[0].body) : null } : null };
+  };
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const FAB = "DevNet_Fabric";
+
+  let w = await wr("create_vrf", { fabricName: FAB, vrfName: "Tenant_C", vrfId: 50010, vlanId: 2010, description: "third tenant", mtu: 9000 });
+  check("create_vrf with a VRF id is ONE POST to its declared route, and no read", !w.isError && w.hits.length === 1 && w.sent.method === "POST" && w.sent.path === `${TD}/vrfs`, JSON.stringify(w.data));
+  check("its body is built here from the arguments: fixed templates, the id as a number and as the segment id", same(w.sent.body, { fabric: FAB, vrfName: "Tenant_C", vrfId: 50010, vrfTemplate: "Default_VRF_Universal", vrfExtensionTemplate: "Default_VRF_Extension_Universal", vrfTemplateConfig: { vrfName: "Tenant_C", vrfSegmentId: "50010", vrfVlanId: "2010", vrfDescription: "third tenant", mtu: "9000" } }), JSON.stringify(w.sent.body));
+  check("the result says what changed, and that nothing reached a switch", w.data.changed === true && w.data.created === "vrf" && w.data.vrfId === 50010 && /on no switch yet/.test(w.data.state));
+  check("the write carries the bearer token the login returned", w.writes[0].authorization === `Bearer ${stub.issued[stub.issued.length - 1]}`);
+  w = await wr("create_vrf", { fabricName: FAB, vrfName: "Tenant_D" });
+  check("create_vrf without an id reads the controller's next free one first, then sends it", !w.isError && w.hits.map((h) => h.method).join() === "GET,POST" && w.hits[0].path.endsWith("/vrfinfo") && w.sent.body.vrfId === 50002 && same(w.sent.body.vrfTemplateConfig, { vrfName: "Tenant_D", vrfSegmentId: "50002" }) && w.data.vrfId === 50002);
+  w = await wr("create_vrf", { fabricName: FAB, vrfName: "Tenant_A", vrfId: 50001 });
+  check("a VRF that exists is the controller's refusal as an error result: nothing changed, sent once", w.isError && w.data.error === "controller_refused_change" && w.data.httpStatus === 400 && w.data.message === "VRF Tenant_A already exists" && /NOTHING WAS CHANGED/.test(w.data.guidance) && w.writes.length === 1, JSON.stringify(w.data));
+
+  w = await wr("create_network", { fabricName: FAB, networkName: "App", vrfName: "Tenant_C", networkId: 30010, vlanId: 2310, gatewayIpAddress: "192.0.2.1/24", description: "app servers", mtu: 9216 });
+  check("create_network sends a routed network with its VRF and gateway", !w.isError && w.hits.length === 1 && w.sent.path === `${TD}/networks` && same(w.sent.body, { fabric: FAB, networkName: "App", displayName: "App", networkId: 30010, networkTemplate: "Default_Network_Universal", networkExtensionTemplate: "Default_Network_Extension_Universal", vrf: "Tenant_C", networkTemplateConfig: { networkName: "App", segmentId: "30010", vrfName: "Tenant_C", vlanId: "2310", vlanName: "App", gatewayIpAddress: "192.0.2.1/24", intfDescription: "app servers", mtu: "9216", isLayer2Only: "false" } }), JSON.stringify(w.sent?.body));
+  w = await wr("create_network", { fabricName: FAB, networkName: "L2_Only", layer2Only: true });
+  check("layer2Only sends vrf NA, and the next free network id from the controller", !w.isError && w.hits.map((h) => h.method).join() === "GET,POST" && w.sent.body.vrf === "NA" && w.sent.body.networkId === 30002 && w.sent.body.networkTemplateConfig.isLayer2Only === "true" && w.data.layer2Only === true && w.data.vrfName === undefined);
+  w = await wr("create_network", { fabricName: FAB, networkName: "NoVrf" });
+  check("a network with neither a VRF nor layer2Only is refused here, before the controller", w.isError && w.data.error === "invalid_arguments" && w.hits.length === 0 && /NOTHING WAS CHANGED/.test(w.data.guidance));
+  w = await wr("create_network", { fabricName: FAB, networkName: "Both", layer2Only: true, vrfName: "Tenant_C" });
+  check("layer2Only together with a VRF is refused here", w.isError && w.data.error === "invalid_arguments" && w.hits.length === 0);
+
+  w = await wr("attach_vrf", { fabricName: FAB, vrfName: "Tenant_C", serialNumber: "960FWK7XGJP" });
+  check("attach_vrf sends one attachment with deployment true and vlan 0 (the controller chooses)", !w.isError && w.hits.length === 1 && w.sent.path === `${TD}/vrfs/attachments` && same(w.sent.body, [{ vrfName: "Tenant_C", lanAttachList: [{ fabric: FAB, vrfName: "Tenant_C", serialNumber: "960FWK7XGJP", vlan: 0, deployment: true }] }]) && /PENDING/.test(w.data.state));
+  w = await wr("attach_vrf", { fabricName: FAB, vrfName: "Tenant_C", serialNumber: "960FWK7XGJP", vlanId: 2010 });
+  check("attach_vrf with a VLAN sends that VLAN", !w.isError && w.sent.body[0].lanAttachList[0].vlan === 2010);
+  w = await wr("attach_vrf", { fabricName: FAB, vrfName: "Tenant_C", serialNumber: "99F2O2W6J0B" });
+  check("a refusal inside an HTTP 200 (a spine) is an error result with the controller's reason, never a success", w.isError && w.data.error === "controller_refused_change" && w.data.httpStatus === 409 && /not supported for SPINE/.test(w.data.message) && /NOTHING WAS CHANGED/.test(w.data.guidance), JSON.stringify(w.data));
+  w = await wr("attach_vrf", { fabricName: FAB, vrfName: "Tenant_C", serialNumber: "ZZZZ99999" });
+  check("an unknown switch is the controller's refusal", w.isError && w.data.httpStatus === 400 && w.data.message === "Invalid Switch Serial Number");
+  w = await wr("detach_vrf", { fabricName: FAB, vrfName: "Tenant_C", serialNumber: "960FWK7XGJP" });
+  check("detach_vrf sends the same attachment with deployment false", !w.isError && w.hits.length === 1 && same(w.sent.body, [{ vrfName: "Tenant_C", lanAttachList: [{ fabric: FAB, vrfName: "Tenant_C", serialNumber: "960FWK7XGJP", vlan: 0, deployment: false }] }]) && w.data.detached === "vrf");
+
+  w = await wr("attach_network", { fabricName: FAB, networkName: "App", serialNumber: "960FWK7XGJP" });
+  check("attach_network without ports sends only the names, the switch and deployment true", !w.isError && w.sent.path === `${TD}/networks/attachments` && same(w.sent.body, [{ networkName: "App", lanAttachList: [{ fabric: FAB, networkName: "App", serialNumber: "960FWK7XGJP", deployment: true }] }]));
+  w = await wr("attach_network", { fabricName: FAB, networkName: "App", serialNumber: "960FWK7XGJP", vlanId: 2310, switchPorts: "Ethernet1/5,Port-channel10" });
+  check("attach_network with a VLAN and ports sends them", !w.isError && same(w.sent.body[0].lanAttachList[0], { fabric: FAB, networkName: "App", serialNumber: "960FWK7XGJP", vlan: 2310, switchPorts: "Ethernet1/5,Port-channel10", deployment: true }) && w.data.switchPorts === "Ethernet1/5,Port-channel10");
+  w = await wr("detach_network", { fabricName: FAB, networkName: "App", serialNumber: "960FWK7XGJP" });
+  check("detach_network sends deployment false", !w.isError && same(w.sent.body[0].lanAttachList[0], { fabric: FAB, networkName: "App", serialNumber: "960FWK7XGJP", deployment: false }) && w.data.detached === "network");
+  w = await wr("detach_network", { fabricName: FAB, networkName: "App", serialNumber: "960FWK7XGJP", detachSwitchPorts: "Ethernet1/5" });
+  check("detach_network with ports takes the ports out and leaves the network attached", !w.isError && same(w.sent.body[0].lanAttachList[0], { fabric: FAB, networkName: "App", serialNumber: "960FWK7XGJP", switchPorts: "", detachSwitchPorts: "Ethernet1/5", deployment: true }) && w.data.detached === "network ports");
+
+  w = await wr("deploy_vrf", { fabricName: FAB, vrfName: "Tenant_C" });
+  check("deploy_vrf posts the VRF's name to the deployments route and reports the controller's own sentence", !w.isError && w.hits.length === 1 && w.sent.path === `${TD}/vrfs/deployments` && same(w.sent.body, { vrfNames: "Tenant_C" }) && /initiated successfully/.test(w.data.controllerSaid) && w.data.deploymentRequested === "vrf");
+  w = await wr("deploy_network", { fabricName: FAB, networkName: "App" });
+  check("deploy_network does the same for a network, and returns no field of the answer but its status", !w.isError && same(w.sent.body, { networkNames: "App" }) && w.data.generatedConfig === undefined && !w.text.includes("username admin"));
+  w = await wr("recalculate_fabric_config", { fabricName: FAB });
+  check("recalculate_fabric_config is one POST with no body", !w.isError && w.hits.length === 1 && w.sent.method === "POST" && w.sent.path === "/lan-fabric/rest/control/fabrics/DevNet_Fabric/config-save" && w.sent.body === null && w.data.recalculated === true);
+  w = await wr("recalculate_fabric_config", { fabricName: "External_Fabric" });
+  check("the controller's plain-sentence refusal (switches unreachable) comes through as the message; the outcome is said to be unknown", w.isError && w.data.error === "controller_error" && w.data.httpStatus === 500 && /reloading or not reachable/.test(w.data.message) && /UNKNOWN/.test(w.data.guidance) && w.writes.length === 1, JSON.stringify(w.data));
+  w = await wr("deploy_fabric_config", { fabricName: FAB });
+  check("deploy_fabric_config posts to config-deploy with forceShowRun=false, a documented parameter", !w.isError && w.sent.path === "/lan-fabric/rest/control/fabrics/DevNet_Fabric/config-deploy" && same(w.sent.query, { forceShowRun: "false" }) && documentedQuery("POST /lan-fabric/rest/control/fabrics/{fabricName}/config-deploy").includes("forceShowRun") && w.data.deploymentRequested === "fabric");
+
+  w = await wr("delete_vrf", { fabricName: FAB, vrfName: "Tenant_B" });
+  check("delete_vrf is one DELETE of the named VRF, and passes on the controller's plain answer", !w.isError && w.hits.length === 1 && w.sent.method === "DELETE" && w.sent.path === `${TD}/vrfs/Tenant_B` && w.sent.body === null && w.data.deleted === "vrf" && w.data.controllerSaid === "VRF(s) deleted successfully");
+  w = await wr("delete_vrf", { fabricName: FAB, vrfName: "Tenant_A" });
+  check("a VRF that still has networks is refused by the controller: an error result, nothing changed", w.isError && w.data.error === "controller_refused_change" && w.data.message === "Delete all networks of Tenant_A before deleting the vrf" && /NOTHING WAS CHANGED/.test(w.data.guidance));
+  w = await wr("delete_network", { fabricName: FAB, networkName: "Old" });
+  check("delete_network is one DELETE; an empty 200 is a success", !w.isError && w.sent.method === "DELETE" && w.sent.path === `${TD}/networks/Old` && w.data.deleted === "network" && w.data.controllerSaid === undefined);
+  w = await wr("delete_network", { fabricName: FAB, networkName: "Web" });
+  check("a network under deployment is refused by the controller", w.isError && /under a Deployment operation/.test(w.data.message) && w.data.httpStatus === 400);
+
+  check("every successful write call sent exactly one write", okWrites.length >= 14 && okWrites.every(([, c]) => c === 1), JSON.stringify(okWrites.filter(([, c]) => c !== 1)));
+  check("every write tool was exercised", WRITE_TOOLS.every((t) => okWrites.some(([name]) => name === t.name)), WRITE_TOOLS.filter((t) => !okWrites.some(([name]) => name === t.name)).map((t) => t.name).join(" "));
+
+  const invalidWrites = [
+    ["a newline in a description", "create_vrf", { fabricName: FAB, vrfName: "X", description: "ok\nfeature bash-shell" }],
+    ["a command separator in a description", "create_vrf", { fabricName: FAB, vrfName: "X", description: "ok ; reload" }],
+    ["a space in a VRF name", "create_vrf", { fabricName: FAB, vrfName: "Tenant X" }],
+    ["VLAN 1", "create_vrf", { fabricName: FAB, vrfName: "X", vlanId: 1 }],
+    ["VLAN 4095", "attach_vrf", { fabricName: FAB, vrfName: "X", serialNumber: "960FWK7XGJP", vlanId: 4095 }],
+    ["a VNI of 0", "create_network", { fabricName: FAB, networkName: "X", vrfName: "Y", networkId: 0 }],
+    ["a gateway without a prefix length", "create_network", { fabricName: FAB, networkName: "X", vrfName: "Y", gatewayIpAddress: "192.0.2.1" }],
+    ["a gateway that is not an address", "create_network", { fabricName: FAB, networkName: "X", vrfName: "Y", gatewayIpAddress: "300.0.2.1/24" }],
+    ["an abbreviated port name", "attach_network", { fabricName: FAB, networkName: "X", serialNumber: "960FWK7XGJP", switchPorts: "Eth1/5" }],
+    ["a port list with a space", "attach_network", { fabricName: FAB, networkName: "X", serialNumber: "960FWK7XGJP", switchPorts: "Ethernet1/5, Ethernet1/6" }],
+    ["a template name", "create_vrf", { fabricName: FAB, vrfName: "X", vrfTemplate: "My_Template" }],
+    ["free-form configuration", "attach_network", { fabricName: FAB, networkName: "X", serialNumber: "960FWK7XGJP", freeformConfig: "username x password y" }],
+    ["a string where a boolean belongs", "create_network", { fabricName: FAB, networkName: "X", layer2Only: "true" }],
+    ["a walked fabric name on a write", "delete_vrf", { fabricName: "..", vrfName: "X" }],
+    ["a slash in a name to delete", "delete_network", { fabricName: FAB, networkName: "Web/../../vrfs/Tenant_A" }],
+    ["a missing switch", "detach_vrf", { fabricName: FAB, vrfName: "X" }],
+  ];
+  for (const [label, tool, args] of invalidWrites) {
+    w = await wr(tool, args);
+    check(`${label} is refused here (invalid_arguments), says nothing changed, and never reaches the controller`, w.isError && w.data.error === "invalid_arguments" && /NOTHING WAS CHANGED/.test(w.data.guidance) && w.hits.length === 0, JSON.stringify(w.data));
+  }
+
+  // What a write does when the controller misbehaves.
+  const WT = await start({ ...localEnvOver, NDFC_MCP_ACCESS: "write" }, {}, (c) => (c.ndfc.writeTimeoutMs = 300));
+  await call(WT.base, "get_controller_info", {}, { assertion: null }); // log in first, so the timeout below is the write's
+  stub.routes[`${TD}/vrfs/deployments`] = () => ({ status: 200, body: { status: "late" }, delayMs: 900 });
+  w = await wr("deploy_vrf", { fabricName: FAB, vrfName: "Tenant_C" }, WT.base);
+  check("a write the controller does not answer in time is write_outcome_unknown (504): it may or may not have been applied", w.isError && w.data.error === "write_outcome_unknown" && w.data.httpStatus === 504 && /MAY OR MAY NOT HAVE BEEN APPLIED/.test(w.data.guidance) && /Do not retry/.test(w.data.guidance), JSON.stringify(w.data));
+  check("and it was sent exactly once: a write is never repeated on a timeout", w.writes.length === 1);
+  delete stub.routes[`${TD}/vrfs/deployments`];
+  let first = true;
+  const loginsBefore = stub.logins;
+  stub.routes[`${TD}/vrfs`] = (hit) => {
+    if (first) {
+      first = false;
+      return { status: 401, body: { error: "Unauthorized" } };
+    }
+    return WRITES[`POST ${TD}/vrfs`](hit);
+  };
+  w = await wr("create_vrf", { fabricName: FAB, vrfName: "Tenant_E", vrfId: 50020 });
+  check("a 401 on a write is the session, refused before the controller acts: one new login, one retry, a success", !w.isError && w.writes.length === 2 && stub.logins === loginsBefore + 1);
+  okWrites.pop(); // two requests for one change, by design: not counted against "exactly one"
+  stub.routes[`${TD}/vrfs`] = () => ({ status: 500, body: { error: "There was a problem proxying the request" } });
+  w = await wr("create_vrf", { fabricName: FAB, vrfName: "Tenant_F", vrfId: 50021 });
+  check("a 500 on a write is an error result, sent once, with the outcome said to be unknown", w.isError && w.data.error === "controller_error" && w.writes.length === 1 && /UNKNOWN/.test(w.data.guidance));
+  stub.routes[`${TD}/vrfs`] = () => ({ status: 302, body: "", headers: { Location: `${EVIL_ORIGIN}/steal` } });
+  w = await wr("create_vrf", { fabricName: FAB, vrfName: "Tenant_G", vrfId: 50022 });
+  check("a redirect on a write is not followed: the body and the token reach no other origin", w.isError && w.data.error === "upstream_redirect" && evil.hits === 0);
+  stub.routes[`${TD}/vrfs`] = () => ({ status: 403, body: { error: "Forbidden" } });
+  w = await wr("create_vrf", { fabricName: FAB, vrfName: "Tenant_H", vrfId: 50023 });
+  check("a 403 on a write says the server's account may be read-only on the controller", w.isError && w.data.error === "controller_refused" && /read-only on the controller/.test(w.data.guidance) && /NOTHING WAS CHANGED/.test(w.data.guidance));
+  delete stub.routes[`${TD}/vrfs`];
+
+  const wClient = createNdfcClient(W.config.ndfc, { now, writeEndpoints: WRITE_ENDPOINTS });
+  n = stub.hits.length;
+  const writeEscapes = [
+    ["a write route no tool declares", "DELETE /lan-fabric/rest/control/fabrics/{fabricName}", "/lan-fabric/rest/control/fabrics/DevNet_Fabric", "write_not_allowed"],
+    ["a declared route with another method", "PUT /lan-fabric/rest/top-down/v2/fabrics/{fabricName}/vrfs", `${TD}/vrfs`, "write_not_allowed"],
+    ["a declared write on another path", WRITE_ENDPOINTS[0], "/lan-fabric/rest/control/policies", "endpoint_mismatch"],
+    ["a GET handed to send()", "GET /lan-fabric/rest/control/fabrics", "/lan-fabric/rest/control/fabrics", "endpoint_mismatch"],
+    ["a declared write with a query smuggled into its path", WRITE_ENDPOINTS[0], `${TD}/vrfs?ticketId=1`, "invalid_path"],
+  ];
+  for (const [label, endpoint, p, code] of writeEscapes) {
+    let err = null;
+    try {
+      await wClient.send(endpoint, p, { body: {} });
+    } catch (e) {
+      err = e;
+    }
+    check(`the write client refuses ${label} before any request`, err instanceof ToolError && err.code === code && stub.hits.length === n, err?.code);
+  }
+  wClient.close();
+  check("a change is logged with who, that it was a write, and what was asked for", /tool=create_vrf user=local access=write args="\{\\"fabricName\\":\\"DevNet_Fabric\\",\\"vrfName\\":\\"Tenant_C\\".*" outcome=ok/.test(W.logs.join("\n")) && /tool=create_vrf user=local access=write args=.* outcome=controller_refused_change/.test(W.logs.join("\n")));
+  check("a refused role is logged without the arguments it never looked at", /tool=create_vrf user=user-1 access=write outcome=write_not_allowed/.test((await (async () => { const X = await start({ NDFC_MCP_ACCESS: "write", NDFC_MCP_ADMIN_EMAILS: "admin@example.invalid", NDFC_MCP_DATA_DIR: tmpDir() }); await call(X.base, "create_vrf", { fabricName: FAB, vrfName: "Secret_Name" }); return X.logs.join("\n"); })())));
+  await call(W.base, "create_vrf", { fabricName: FAB, vrfName: "X", password: "hunter2-pasted-by-mistake" }, { assertion: null });
+  check("arguments that did not pass validation are not logged", /tool=create_vrf user=local access=write outcome=invalid_arguments/.test(W.logs.join("\n")) && !W.logs.join("\n").includes("hunter2"));
+  check("a read is logged as before, with no arguments", (await call(W.base, "list_fabrics", {}, { assertion: null })).isError === false && /tool=list_fabrics user=local outcome=ok/.test(W.logs.join("\n")));
+  const va = await call(W.base, "list_vrf_attachments", { fabricName: FAB, vrfName: "Tenant_A" }, { assertion: null });
+  check("list_vrf_attachments returns one row per switch with its state, and sends the VRF name as the documented filter", !va.isError && va.data.attachments.length === 2 && same(va.data.attachments[0], { vrfName: "Tenant_A", switch: "leaf1", serialNumber: "960FWK7XGJP", role: "leaf", attached: true, state: "DEPLOYED", vlanId: 2001 }) && va.data.attachments[1].attached === false && stub.hits[stub.hits.length - 1].query["vrf-names"] === "Tenant_A", JSON.stringify(va.data));
+  const na = await call(W.base, "list_network_attachments", { fabricName: FAB }, { assertion: null });
+  check("list_network_attachments returns the ports, and neither instance values nor free-form configuration", !na.isError && na.data.attachments[0].ports === "Ethernet1/5,Ethernet1/6" && na.data.attachments[0].state === "PENDING" && na.data.attachments[0].instanceValues === undefined && na.data.attachments[0].freeformConfig === undefined && same(stub.hits[stub.hits.length - 1].query, {}));
+
+  // ───────────────────────── roles and grants ─────────────────────────
+  section("roles and grants (gateway mode, NDFC_MCP_ACCESS=write)");
+  const dataDir = tmpDir();
+  const ADMIN = "admin@example.invalid";
+  const gwWriteEnv = (dir) => ({ NDFC_MCP_ACCESS: "write", NDFC_MCP_ADMIN_EMAILS: "Admin@Example.invalid", NDFC_MCP_DATA_DIR: dir });
+  const G = await start(gwWriteEnv(dataDir));
+  const as = (email, sub) => ({ assertion: hsAssertion({ sub, ...(email ? { email } : {}) }, email ? {} : { drop: ["email"] }) });
+  const admin = () => as(ADMIN, "user-admin");
+  const alice = () => as("alice@example.invalid", "user-alice");
+  const gl = (await rpc(G.base, "tools/list")).json.result.tools;
+  check("tools/list is the read tools, the write tools, then the three grant tools", gl.map((t) => t.name).join() === [...READ_TOOLS, ...WRITE_TOOLS, ...GRANT_TOOLS].map((t) => t.name).join());
+  const ghz = await (await fetch(`${G.base}/healthz`)).json();
+  check("/healthz counts grants and administrators, and names nobody", ghz.access === "write" && same(ghz.grants, { grants: 0, administrators: 1 }) && !JSON.stringify(ghz).includes("example.invalid"));
+
+  check("a person with no grant reads", !(await call(G.base, "list_fabrics", {}, alice())).isError);
+  w = await wr("create_vrf", { fabricName: FAB, vrfName: "Tenant_J", vrfId: 50030 }, G.base, alice());
+  check("and is refused every write (write_not_allowed, 403): nothing changed, nothing reached the controller", w.isError && w.data.error === "write_not_allowed" && w.data.httpStatus === 403 && /read-only access/.test(w.data.guidance) && /NOTHING WAS CHANGED/.test(w.data.guidance) && w.hits.length === 0, JSON.stringify(w.data));
+  const refusedAll = [];
+  for (const t of WRITE_TOOLS) if ((await call(G.base, t.name, {}, alice())).data?.error !== "write_not_allowed") refusedAll.push(t.name);
+  check("the role is checked before the arguments, for every write tool: a reader learns nothing about what a write accepts", refusedAll.length === 0, refusedAll.join(" "));
+  check("a reader cannot see or change grants (admin_required)", (await call(G.base, "grant_list", {}, alice())).data.error === "admin_required" && (await call(G.base, "grant_set", { email: "alice@example.invalid", role: "write" }, alice())).data.error === "admin_required");
+  w = await wr("create_vrf", { fabricName: FAB, vrfName: "Tenant_J", vrfId: 50030 }, G.base, { assertion: null });
+  check("a write without an identity is identity_required, and says nothing changed", w.isError && w.data.error === "identity_required" && /NOTHING WAS CHANGED/.test(w.data.guidance) && w.hits.length === 0);
+
+  const list0 = await call(G.base, "grant_list", {}, admin());
+  check("the administrator named in the configuration is recognised whatever the case of the address, and listed as such", !list0.isError && same(list0.data.grants, [{ email: ADMIN, role: "admin", source: "server configuration" }]) && list0.data.everyoneElse === "read");
+  const set1 = await call(G.base, "grant_set", { email: "Alice@Example.invalid", role: "write" }, admin());
+  check("grant_set gives a person the write role", !set1.isError && same(set1.data, { changed: true, email: "alice@example.invalid", role: "write", previousRole: "read (no grant)" }), JSON.stringify(set1.data));
+  w = await wr("create_vrf", { fabricName: FAB, vrfName: "Tenant_J", vrfId: 50030 }, G.base, alice());
+  check("and that person's next write reaches the controller", !w.isError && w.writes.length === 1 && /tool=create_vrf user=user-alice access=write/.test(G.logs.join("\n")));
+  check("the address is matched whatever its case", !(await wr("deploy_vrf", { fabricName: FAB, vrfName: "Tenant_J" }, G.base, as("ALICE@EXAMPLE.INVALID", "user-alice"))).isError);
+  check("an assertion that carries no e-mail address matches no grant: it reads", (await call(G.base, "create_vrf", { fabricName: FAB, vrfName: "Tenant_K" }, as(null, "user-alice"))).data.error === "write_not_allowed" && !(await call(G.base, "list_fabrics", {}, as(null, "user-alice"))).isError);
+  const stored = JSON.parse(fs.readFileSync(path.join(dataDir, "grants.json"), "utf8"));
+  check("the grant is stored by address with who gave it and when, in a file only the server reads", stored.version === 1 && stored.grants["alice@example.invalid"].role === "write" && stored.grants["alice@example.invalid"].by === ADMIN && /^\d{4}-/.test(stored.grants["alice@example.invalid"].at) && (process.platform === "win32" || (fs.statSync(path.join(dataDir, "grants.json")).mode & 0o077) === 0));
+  const changelog = fs.readFileSync(path.join(dataDir, "changelog.ndjson"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  check("and the change is in the changelog with its actor", changelog.length === 1 && changelog[0].action === "grant_set" && changelog[0].actor === ADMIN && changelog[0].email === "alice@example.invalid" && changelog[0].role === "write" && changelog[0].previous === null);
+  check("a writer is not an administrator: no grant tool runs, and the file does not change", (await call(G.base, "grant_set", { email: "bob@example.invalid", role: "write" }, alice())).data.error === "admin_required" && Object.keys(JSON.parse(fs.readFileSync(path.join(dataDir, "grants.json"), "utf8")).grants).length === 1);
+  check("grant_set to admin lets that person manage grants", (await call(G.base, "grant_set", { email: "alice@example.invalid", role: "admin" }, admin())).data.previousRole === "write" && !(await call(G.base, "grant_list", {}, alice())).isError);
+  const rev = await call(G.base, "grant_revoke", { email: "alice@example.invalid" }, admin());
+  check("grant_revoke leaves the person with read access, from their next call", same(rev.data, { changed: true, email: "alice@example.invalid", role: "read", previousRole: "admin" }) && (await call(G.base, "create_vrf", { fabricName: FAB, vrfName: "Tenant_K" }, alice())).data.error === "write_not_allowed");
+  check("revoking someone who holds no grant changes nothing and says so", same((await call(G.base, "grant_revoke", { email: "nobody@example.invalid" }, admin())).data, { changed: false, email: "nobody@example.invalid", role: "read", previousRole: "read (no grant)" }));
+  const cfgAdmin = await call(G.base, "grant_set", { email: ADMIN, role: "read" }, admin());
+  check("an administrator named in the configuration cannot be demoted or revoked by a grant", cfgAdmin.isError && cfgAdmin.data.error === "configured_administrator" && /NO GRANT WAS CHANGED/.test(cfgAdmin.data.guidance) && (await call(G.base, "grant_revoke", { email: ADMIN }, admin())).data.error === "configured_administrator");
+  check("an address that is not one, and a role that does not exist, are refused", (await call(G.base, "grant_set", { email: "not-an-address", role: "write" }, admin())).data.error === "invalid_arguments" && (await call(G.base, "grant_set", { email: "bob@example.invalid", role: "root" }, admin())).data.error === "invalid_arguments");
+  n = dataHits();
+  await call(G.base, "grant_list", {}, admin());
+  check("the grant tools never call the controller", dataHits() === n);
+
+  await call(G.base, "grant_set", { email: "bob@example.invalid", role: "write" }, admin());
+  const G2 = await start(gwWriteEnv(dataDir));
+  check("a grant survives a restart: a new server on the same directory honours it", !(await wr("deploy_network", { fabricName: FAB, networkName: "App" }, G2.base, as("bob@example.invalid", "user-bob"))).isError && (await (await fetch(`${G2.base}/healthz`)).json()).grants.grants === 1);
+
+  const brokenDir = tmpDir();
+  fs.writeFileSync(path.join(brokenDir, "grants.json"), '{"version":1,"grants":{"bob@example.invalid":{"role":"write"');
+  const G3 = await start(gwWriteEnv(brokenDir));
+  const g3hz = await (await fetch(`${G3.base}/healthz`)).json();
+  check("a grants file that cannot be read gives nobody a role: everyone reads, and /healthz says the grants are suspended", (await call(G3.base, "deploy_network", { fabricName: FAB, networkName: "App" }, as("bob@example.invalid", "user-bob"))).data.error === "write_not_allowed" && /suspended/.test(g3hz.grants.loadError));
+  check("the configured administrator still manages, and a new grant repairs the file", !(await call(G3.base, "grant_set", { email: "bob@example.invalid", role: "write" }, admin())).isError && JSON.parse(fs.readFileSync(path.join(brokenDir, "grants.json"), "utf8")).grants["bob@example.invalid"].role === "write" && (await (await fetch(`${G3.base}/healthz`)).json()).grants.loadError === undefined);
+
+  const notADir = path.join(tmpDir(), "a-file");
+  fs.writeFileSync(notADir, "x");
+  const G4 = await start(gwWriteEnv(path.join(notADir, "sub")));
+  const unstored = await call(G4.base, "grant_set", { email: "carol@example.invalid", role: "write" }, admin());
+  check("a grant that cannot be stored is refused, not kept in memory: the person still reads", unstored.isError && unstored.data.error === "grants_not_stored" && /NO GRANT WAS CHANGED/.test(unstored.data.guidance) && (await call(G4.base, "create_vrf", { fabricName: FAB, vrfName: "Tenant_L" }, as("carol@example.invalid", "user-carol"))).data.error === "write_not_allowed");
+
   // ───────────────────────── stdio ─────────────────────────
   section("stdio");
   const stdioPath = path.join(HERE, "..", "server", "stdio.mjs");
@@ -644,7 +1010,7 @@ try {
   allBodies.push(session.raw);
   const byId = (id) => session.messages.find((m) => m.id === id);
   check("a whole session over stdin/stdout: one line out per request, none for the notification, exit 0", session.code === 0 && session.messages.length === 5, `exit ${session.code}, ${session.messages.length} messages`);
-  check("initialize and tools/list answer as over HTTP", byId(1)?.result?.serverInfo?.name === "ndfc-mcp" && byId(2)?.result?.tools?.length === TOOLS.length);
+  check("initialize and tools/list answer as over HTTP", byId(1)?.result?.serverInfo?.name === "ndfc-mcp" && byId(2)?.result?.tools?.length === READ_TOOLS.length);
   check("a tool call returns the same result", JSON.parse(byId(3)?.result?.content?.[0]?.text || "{}").fabrics?.length === 2);
   check("an invalid argument is the same error result", byId(4)?.result?.isError === true && /invalid_arguments/.test(byId(4).result.content[0].text));
   check("an unparseable line is answered with the server's parse error", session.messages.some((m) => m.error?.code === -32700));
@@ -662,7 +1028,7 @@ try {
   // ───────────────────────── nothing secret leaves ─────────────────────────
   section("nothing secret leaves");
   const everything = allBodies.join("\n");
-  const logs = [S, R, F, C, L, U, T, LOCAL].flatMap((s) => s.logs).join("\n");
+  const logs = [S, R, F, C, L, U, T, LOCAL, W, WT, G, G2, G3, G4].flatMap((s) => s.logs).join("\n");
   for (const [label, secret] of [["the controller password", PASSWORD], ["a fabric BGP key", BGP_KEY], ["an AAA key inside free-form config", AAA_KEY], ["a local-user password hash", USER_HASH], ["a VRF BGP password", VRF_PASSWORD], ["a stored switch credential", SWITCH_CRED], ["the registration API key", API_KEY], ["the assertion secret", HS_SECRET]]) {
     check(`${label} is in no response body and no log line`, !everything.includes(secret) && !logs.includes(secret));
   }
@@ -673,6 +1039,7 @@ try {
   console.error("\nharness crashed:", error);
 } finally {
   for (const s of servers) s.close();
+  for (const d of tmpDirs) fs.rmSync(d, { recursive: true, force: true });
   stubServer.close();
   evilServer.close();
 }

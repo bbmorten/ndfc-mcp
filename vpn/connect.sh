@@ -12,9 +12,22 @@
 #                            value to use when it refuses the certificate)
 #            VPN_EXTRA_ARGS  more OpenConnect arguments, space-separated
 #            VPN_RETRY_SECONDS  wait between attempts (default 10)
+#            VPN_MODE        tunnel (default) | proxy
+#            VPN_FORWARDS    proxy mode, required: space-separated lport:host:rport
 #
-# The tunnel exists only inside this container's network namespace (shared with
-# the ndfc-mcp container). Nothing on the host is rerouted.
+# Two modes.
+#
+#   tunnel  A tun0 interface with the gateway's routes, in this container's
+#           network namespace (shared with the ndfc-mcp container). Needs
+#           NET_ADMIN and /dev/net/tun. Nothing on the host is rerouted.
+#
+#   proxy   No interface, no route, no DNS change, NO PRIVILEGE: OpenConnect
+#           hands the VPN packets to ocproxy (--script-tun), which serves each
+#           VPN_FORWARDS entry as a TCP port on 127.0.0.1. The server is then
+#           pointed at the forward (NDFC_URL=https://127.0.0.1:<lport>). For a
+#           place that gives a container no capability, such as a Kubernetes
+#           pod: the container runs as any user with every capability dropped,
+#           and the pod's resolv.conf and routes stay the cluster's.
 set -u
 
 log() { printf 'level=%s msg="%s"\n' "$1" "$2"; }
@@ -27,16 +40,44 @@ if [ -n "$missing" ]; then
   log error "the VPN sidecar refuses to start; not set:$missing"
   exit 1
 fi
-if [ ! -c /dev/net/tun ]; then
-  log error "/dev/net/tun is missing: the container needs devices: [/dev/net/tun] and cap_add: [NET_ADMIN]"
-  exit 1
-fi
+MODE="${VPN_MODE:-tunnel}"
+case "$MODE" in
+  tunnel)
+    if [ ! -c /dev/net/tun ]; then
+      log error "/dev/net/tun is missing: the container needs devices: [/dev/net/tun] and cap_add: [NET_ADMIN] (or VPN_MODE=proxy, which needs neither)"
+      exit 1
+    fi
+    ;;
+  proxy)
+    if [ -z "${VPN_FORWARDS:-}" ]; then
+      log error "VPN_MODE=proxy needs VPN_FORWARDS (lport:host:rport, space-separated): without a forward nothing reaches the VPN"
+      exit 1
+    fi
+    for f in $VPN_FORWARDS; do
+      case "$f" in
+        *[!0-9A-Za-z.:-]*|*:*:*:*) log error "VPN_FORWARDS entry is not lport:host:rport: $f"; exit 1 ;;
+        [0-9]*:?*:[0-9]*) ;;
+        *) log error "VPN_FORWARDS entry is not lport:host:rport: $f"; exit 1 ;;
+      esac
+    done
+    ;;
+  *)
+    log error "VPN_MODE must be tunnel or proxy, got: $MODE"
+    exit 1
+    ;;
+esac
 
 PROTOCOL="${VPN_PROTOCOL:-anyconnect}"
 RETRY="${VPN_RETRY_SECONDS:-10}"
 
 # Build the argument list without eval; the password is not part of it.
-set -- --protocol="$PROTOCOL" --user="$VPN_USERNAME" --passwd-on-stdin --non-inter --interface=tun0 --reconnect-timeout=60
+set -- --protocol="$PROTOCOL" --user="$VPN_USERNAME" --passwd-on-stdin --non-inter --reconnect-timeout=60
+if [ "$MODE" = "proxy" ]; then
+  # The hook becomes ocproxy; it reads VPN_FORWARDS from the environment.
+  set -- "$@" --script-tun --script=/usr/local/bin/vpn-proxy-hook
+else
+  set -- "$@" --interface=tun0
+fi
 [ -n "${VPN_AUTHGROUP:-}" ]  && set -- "$@" --authgroup="$VPN_AUTHGROUP"
 [ -n "${VPN_SERVERCERT:-}" ] && set -- "$@" --servercert="$VPN_SERVERCERT"
 if [ -n "${VPN_EXTRA_ARGS:-}" ]; then
@@ -56,7 +97,7 @@ trap stop TERM INT
 attempt=0
 while :; do
   attempt=$((attempt + 1))
-  log info "connecting to $VPN_SERVER as $VPN_USERNAME (protocol $PROTOCOL, attempt $attempt)"
+  log info "connecting to $VPN_SERVER as $VPN_USERNAME (protocol $PROTOCOL, mode $MODE, attempt $attempt)"
   # printf is a shell builtin: the password never appears in a process list.
   printf '%s\n' "$VPN_PASSWORD" | openconnect "$@" "$VPN_SERVER" &
   child=$!

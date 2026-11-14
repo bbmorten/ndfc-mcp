@@ -1,17 +1,22 @@
 # ndfc-mcp
 
-A read-only [MCP](https://modelcontextprotocol.io) server for **Cisco Nexus Dashboard Fabric
-Controller (NDFC)**. It lets an AI assistant — Claude Code, Claude Desktop, aimo for VS Code —
-answer questions about your data-center fabric: which fabrics exist, which switches are in them
-and whether they are in sync, what an interface is doing, what is alarming, what was deployed.
+An [MCP](https://modelcontextprotocol.io) server for **Cisco Nexus Dashboard Fabric Controller
+(NDFC)**. It lets an AI assistant — Claude Code, Claude Desktop, aimo for VS Code — answer
+questions about your data-center fabric: which fabrics exist, which switches are in them and
+whether they are in sync, what an interface is doing, what is alarming, what was deployed. Given
+write access, it can also create, attach, deploy and delete VRFs and overlay networks.
 
 It runs on your own machine with Docker Compose and **brings its own VPN**: a sidecar container
 opens the Cisco AnyConnect tunnel to the controller's network, so your laptop's own network and
 VPN stay as they are.
 
-It cannot change anything. Every tool is a `GET`; the server has no code path to a write.
+**It is read-only unless you say otherwise.** As it starts by default, every tool is a `GET`
+and the server cannot send a change to the controller. [Write access](#write-access) is one
+setting, and who may use it is decided per person when the server runs behind a gateway.
 
 ## The tools
+
+These are always there, and none of them changes anything:
 
 | Tool | Answers |
 | --- | --- |
@@ -24,18 +29,32 @@ It cannot change anything. Every tool is a `GET`; the server has no code path to
 | `list_links` | One fabric's links, both ends of each |
 | `list_switch_policies` | Which templates configure this switch |
 | `list_vrfs`, `list_networks` | The VRFs and overlay networks of a fabric |
+| `list_vrf_attachments`, `list_network_attachments` | Which switches a VRF or network is attached to, and its state on each (`NA`, `PENDING`, `DEPLOYED`, …) |
 | `list_alarms` | What is alarming, where, since when |
 | `list_deploy_history` | What the controller deployed, to which switch, with what outcome |
 
 Start with `list_fabrics` (it gives the fabric names the others take) and `list_switches` (it
 gives the serial numbers).
 
+With [write access](#write-access) turned on, these are offered as well:
+
+| Tool | Does |
+| --- | --- |
+| `create_vrf`, `delete_vrf` | Creates or deletes a VRF on the controller |
+| `create_network`, `delete_network` | Creates or deletes an overlay network (routed in a VRF, or layer 2 only) |
+| `attach_vrf`, `detach_vrf` | Attaches a VRF to one switch, or detaches it |
+| `attach_network`, `detach_network` | Attaches a network to one switch and its ports, or detaches it |
+| `deploy_vrf`, `deploy_network` | **Configures switches:** pushes the pending changes of one VRF or network |
+| `recalculate_fabric_config` | NDFC's *Recalculate Config* for one fabric |
+| `deploy_fabric_config` | **Configures switches:** NDFC's *Deploy Config* for one fabric |
+
 ## What you need
 
 - **Docker** with Compose v2 (Docker Desktop on macOS/Windows, Docker Engine on Linux). On
   Windows, see [On Windows](#on-windows) for the commands.
 - **A controller** — Nexus Dashboard with the Fabric Controller service — and an account on it.
-  A read-only account (role `network-operator`) is all the server needs.
+  A read-only account (role `network-operator`) is all a read-only server needs. With write
+  access the account needs a role that may write (`network-admin`).
 - **The VPN details** for the controller's network, as you would type them into Cisco
   AnyConnect / Secure Client: gateway (`host` or `host:port`), username, password.
 
@@ -54,8 +73,9 @@ cd ndfc-mcp
 ```
 
 It needs Docker and Node 18 or newer on this machine. It asks how the controller is reached (the
-VPN sidecar or directly), the controller and VPN logins, the certificate mode, the API key and
-the port. Every answer comes pre-filled, so Enter keeps it. Then it writes `.env`, builds and
+VPN sidecar or directly), the controller and VPN logins, the certificate mode, the API key, the
+port, and whether the server may only read or also write (read only, unless you choose
+otherwise). Every answer comes pre-filled, so Enter keeps it. Then it writes `.env`, builds and
 starts the containers, and checks that the controller answers through the server. Last, it
 registers the server with **Claude Code** (`.mcp.json` here, or user/local scope through the
 `claude` CLI), **Claude Desktop** and **aimo for VS Code**. It changes only the `ndfc` entry in
@@ -83,6 +103,7 @@ Edit `.env`. It asks for three things:
 | `VPN_SERVER`, `VPN_USERNAME`, `VPN_PASSWORD` | The VPN gateway and login |
 
 Put a value that contains `$` in `'single quotes'`. `.env` is git-ignored; keep it that way.
+`NDFC_MCP_ACCESS=write` is the fourth, optional one: see [Write access](#write-access).
 
 ```bash
 docker compose up -d --build
@@ -112,6 +133,12 @@ docker compose -f compose.direct.yaml up -d --build
 
 Same server, same `.env` (the `VPN_*` lines are ignored), same port. Use
 `-f compose.direct.yaml` in every `docker compose` command below, and `bin/client-config direct`.
+
+The same file serves a controller that the host reaches only through a **local port forward**,
+for example one opened through an SSH or SOCKS proxy to the controller's network. Point
+`NDFC_URL` at the forward as the container sees it, `https://host.docker.internal:<port>`, and
+keep `NDFC_TLS_INSECURE=true` or a pinned CA: the certificate does not name that address. (Seen
+working with Docker Desktop on macOS, 2026-11-14.)
 
 ### On Windows
 
@@ -175,7 +202,8 @@ claude mcp add --transport http ndfc http://127.0.0.1:3300/mcp \
   --header "X-Api-Key: $(grep -E '^NDFC_MCP_API_KEY=' .env | cut -d= -f2-)"
 ```
 
-Start a new session and type `/mcp`: `ndfc` should show **Connected** with 12 tools. Add
+Start a new session and type `/mcp`: `ndfc` should show **Connected** with 14 tools (26 with
+write access). Add
 `--scope user` to either command to have it in every project instead of only the current one.
 
 To share it with a team through a repository, commit a `.mcp.json` like this and let each person
@@ -217,8 +245,9 @@ paste the stdio block that `bin/client-config` prints. It looks like this, with 
 ```
 
 The server appears in the **Tool Servers** view, and the model sees it as `own_ndfc`. Before it
-first runs, aimo shows the exact command and asks; after that its tools run without a prompt,
-because every one is marked read-only.
+first runs, aimo shows the exact command and asks; after that its read tools run without a
+prompt, because each is marked read-only. The write tools are not, and the ones that delete,
+detach or deploy are marked destructive, so a client that asks before a change asks before each.
 
 Prefer stdio here. The HTTP form works too (`bin/client-config` prints it), but its API key must
 be stored with **AIMO: Set Local Server Secret**, and aimo then asks for approval on *every* call
@@ -242,8 +271,10 @@ addressing — with what the first four found on the sandbox.
 
 ## What it will and will not tell you
 
-- **Read-only.** No tool creates, changes, deploys or deletes anything.
-- **One account.** Everyone who can reach this server sees what `NDFC_USERNAME` sees.
+- **Read-only by default.** Unless `NDFC_MCP_ACCESS=write` is set, no tool creates, changes,
+  deploys or deletes anything, and the server has no way to send a change.
+- **One account.** Everyone who can reach this server sees what `NDFC_USERNAME` sees, and with
+  write access changes the controller as that account.
 - **Secrets stay on the controller.** Secret fabric settings come back as `[redacted]` (it means
   *a value is set*). Free-form configuration text is omitted. The rendered device configuration
   of a policy and the command text of a deployment are never returned: they contain password
@@ -252,6 +283,68 @@ addressing — with what the first four found on the sandbox.
   many, and which filter narrows the list (`nameContains`, `templateContains`, `severity`, …).
 - **An error is an error.** A controller that is down, still starting or unreachable produces an
   error result that says there is no data — not an empty list.
+
+## Write access
+
+Set `NDFC_MCP_ACCESS=write` in `.env` (or answer *Read and write* in `./setup`) and run
+`docker compose up -d`. `/healthz` then reports `"access":"write"`, the twelve write tools are
+listed, and the server's instructions tell the model how to use them. Remove the line and the
+server is read-only again: the write tools are gone and a call to one is an unknown tool.
+
+What a change is, here:
+
+- **Intent first, switches second.** `create_*`, `attach_*` and `detach_*` change the
+  controller only; the object or attachment becomes `PENDING`. Nothing reaches a switch until a
+  `deploy_*` tool runs. The usual order is create → attach → deploy, and to remove: detach →
+  deploy → delete. The controller refuses a delete while something is attached, deployed or
+  waiting for a deployment, and says why.
+- **Names and numbers, never configuration text.** A write tool takes a fabric, a name, a VNI, a
+  VLAN, a gateway address, switch ports and a plain-text description. It takes no template name,
+  no free-form configuration and no raw request body, and every string is held to a pattern that
+  admits no newline, quote or command separator. Each tool sends one request to one route.
+- **Only these routes.** The controller documents 385 write operations; this server can send
+  the ten its tools declare. Policies, interfaces, templates, switch discovery, credentials and
+  every bulk or import route are out of reach.
+- **Every change is in the log** with who asked and what for:
+  `tool=create_vrf user=local access=write args="{…}" outcome=ok`.
+- **An error says whether anything changed.** A refusal by the controller is
+  `controller_refused_change` with its reason and "nothing was changed". A controller that did
+  not answer in time is `write_outcome_unknown`: the change may or may not have been applied, so
+  the state is read before anything is tried again. A write is never repeated on its own.
+
+In local mode, the mode you get on your own machine, whoever holds the API key may use the write
+tools. Deploying configures switches in a running network: give the server write access on a
+controller where you would make the same change by hand.
+
+### Behind a gateway: read or write, per person
+
+When the server runs behind a gateway that signs people in (`NDFC_MCP_MODE=gateway`; the
+gateway forwards a signed statement of who is calling), write access is given **per person**:
+
+```bash
+NDFC_MCP_MODE=gateway
+NDFC_MCP_SLUG=ndfc                              # the audience every assertion must carry
+NDFC_MCP_CP_URL=https://gateway.example.net     # where the assertion's public key is fetched
+NDFC_MCP_ACCESS=write
+NDFC_MCP_ADMIN_EMAILS=first.admin@example.net   # who may hand out write access
+NDFC_MCP_DATA_DIR=/data                         # where the grants are kept (a volume)
+```
+
+Everyone the gateway lets through can read. A person can write only when an administrator has
+granted it, and the administrators are the addresses in `NDFC_MCP_ADMIN_EMAILS` plus anyone they
+make one. Three more tools, for administrators only, manage this, and a gateway's dashboard can
+call them:
+
+| Tool | Does |
+| --- | --- |
+| `grant_list` | Who holds which role; everyone else reads |
+| `grant_set` | Gives one person `read`, `write` or `admin` |
+| `grant_revoke` | Removes a person's grant, which leaves them with read |
+
+A person without the role who calls a write tool gets `write_not_allowed` and nothing happens.
+Grants are kept in `grants.json` under `NDFC_MCP_DATA_DIR`, with every change in
+`changelog.ndjson` beside it; neither holds a secret. With `NDFC_MCP_ACCESS` left at `read`, a
+gateway-mode server is read-only for everyone, whatever was granted.
 
 ## The VPN sidecar
 
@@ -314,25 +407,46 @@ docker compose down                   # stop; the tunnel closes with it
 | Client shows the server as failed, HTTP 401 | The API key the client sends is not the one in `.env` | Re-add the server; restart it after changing the key |
 | HTTP 403 | The request carried an `Origin` header (it came from a web page) | Call it from an MCP client, not a browser |
 | `truncated: true` in an answer | The list did not fit one tool result | Ask again with the filter the answer names |
+| `unknown tool: create_vrf` (or another write tool) | The server is read-only | Set `NDFC_MCP_ACCESS=write`; see [Write access](#write-access) |
+| Tool error `write_not_allowed` | Behind a gateway: the caller has no write grant | An administrator runs `grant_set` for them |
+| Tool error `controller_refused_change` | The controller refused the change; nothing changed | The message is the controller's reason: the object exists, is still attached, is under deployment, or the switch cannot take it |
+| Tool error `controller_refused`, HTTP 403, on a write | The controller account may not write | Give `NDFC_USERNAME` a role that may (`network-admin`) |
+| Tool error `write_outcome_unknown` | The controller did not answer a change within `NDFC_WRITE_TIMEOUT_MS` (90 s) | Read the state (`list_vrf_attachments`, `list_deploy_history`) before retrying. A deployment to a switch the controller cannot reach does this |
+| `Delete is not allowed as the Network is under a Deployment operation` | A detach is still `PENDING` | Deploy it first; while the switch is unreachable the controller keeps the object |
 
 ## Tests
 
 ```bash
-node test/verify-local.mjs    # 175 checks against a stub controller; no network, no credentials
-node test/live-check.mjs      # every tool against the real controller in .env (run where node can reach it)
+node test/verify-local.mjs    # 294 checks against a stub controller; no network, no credentials
+node test/live-check.mjs      # every read tool against the real controller in .env (run where node can reach it)
+node test/live-check.mjs --write            # also the roles, and a VRF and a network created and deleted
+node test/live-check.mjs --write --deploy   # also attached to a leaf, deployed, detached, deployed
 ```
 
-Both need only Node.js 20 or later; the server has no npm dependencies.
+Both need only Node.js 20 or later; the server has no npm dependencies. Without `--write` the
+live check changes nothing. `--write` creates `MCPCHK_VRF` and `MCPCHK_NET` and deletes them
+again; `--deploy` configures one leaf and is skipped when the controller does not reach it. Run
+those two against a lab. `--url <origin>` replaces the controller address, for a port forward.
 
 ## Status
 
-Version 0.2.0. Verified on 2026-11-12 against the DevNet sandbox (NDFC 12.2.2 on Nexus Dashboard
-3.2): all twelve tools, both transports with Claude Code, the image run read-only without
-capabilities, the CA pin, and the VPN sidecar — it logged in to the sandbox's AnyConnect gateway
-(group `SSLClient`, DTLS), took the split-tunnel routes, and the server answered through it over
-HTTP and stdio. **Not yet verified:** Claude Desktop and the aimo extension (the configuration
-follows each client's documented format), and a gateway other than the sandbox's. `list_vrfs` and
-`list_networks` have only seen empty lists, because the sandbox fabric defines none.
+Version 0.3.0. Version 0.2.0 was verified on 2026-11-12 against the DevNet sandbox (NDFC 12.2.2
+on Nexus Dashboard 3.2): the twelve read tools it had, both transports with Claude Code, the
+image run read-only without capabilities, the CA pin, and the VPN sidecar — it logged in to the
+sandbox's AnyConnect gateway (group `SSLClient`, DTLS), took the split-tunnel routes, and the
+server answered through it over HTTP and stdio. **Not yet verified:** Claude Desktop, and a
+gateway other than the sandbox's.
+
+Write access (0.3.0) was verified on 2026-11-14 against a new reservation of the same sandbox,
+reached through a port forward: `live-check.mjs` read-only (29 checks, CA pinned, no write
+sent) and with `--write` (the roles, then a VRF and a network created, read back and deleted,
+the controller left as it was). The attach, detach, recalculate and deploy tools were called
+through the server and the image, over HTTP and stdio. **Not verified: a deployment that
+succeeds.** The sandbox's switches were still starting, so the controller reached none of the
+leaves; `deploy_network` ended as `write_outcome_unknown`, and the `--deploy` cycle skipped
+itself. The answer of a successful `deploy_*` or `deploy_fabric_config` is therefore taken from
+Cisco's API document, not seen. No MCP client was driven with the write tools, and the server
+was not run behind a real gateway: the grants were exercised with assertions signed by the tests.
 
 On Windows 11 with Docker Desktop (same day): the 175 checks pass, and `.\setup` built and
 started the server without the sidecar, saw it healthy, and reached it over HTTP and over stdio

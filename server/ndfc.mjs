@@ -1,13 +1,20 @@
 /**
- * The controller client: one Nexus Dashboard login, cached, and GET requests
- * to the NDFC API under it. Nothing else.
+ * The controller client: one Nexus Dashboard login, cached, and requests to the
+ * NDFC API under it. Nothing else.
  *
- * Four properties carry it, and each closes a way this goes wrong:
+ * Five properties carry it, and each closes a way this goes wrong:
  *
- *   GET ONLY, ONE ENDPOINT PER CALL. `get()` takes the calling tool's declared
- *   endpoint and refuses any path that does not match it, before a byte leaves
- *   the server. The single POST this module makes is the login, to a fixed
- *   path, with no caller-supplied part.
+ *   ONE DECLARED ENDPOINT PER CALL. `get()` and `send()` take the calling
+ *   tool's declared endpoint and refuse any method or path that does not match
+ *   it, before a byte leaves the server. The login is a POST to a fixed path
+ *   with no caller-supplied part.
+ *
+ *   WRITES ARE A LIST, AND THE LIST CAN BE EMPTY. `send()` (POST, PUT, DELETE)
+ *   accepts only the endpoints handed to createNdfcClient as `writeEndpoints`.
+ *   A read-only server hands it none, so that client cannot send a write
+ *   whatever calls it. A write is never repeated on its own: the one retry is
+ *   after a 401, which the controller answers before it does anything, and a
+ *   write that times out is reported as outcome unknown.
  *
  *   NO REDIRECTS. node:http(s) never follows one, and a 3xx is an error here:
  *   the bearer token and the login body must never travel to another origin.
@@ -81,6 +88,10 @@ export function loadNdfcConfig(env) {
 
   const timeoutMs = Number.parseInt(env.NDFC_TIMEOUT_MS || "20000", 10);
   if (!Number.isFinite(timeoutMs) || timeoutMs < 1000 || timeoutMs > 25_000) missing.push("NDFC_TIMEOUT_MS must be between 1000 and 25000");
+  // A deployment answers when the controller has reached the switches, which
+  // took over 60 s on the lab while they were down. Writes get their own limit.
+  const writeTimeoutMs = Number.parseInt(env.NDFC_WRITE_TIMEOUT_MS || "90000", 10);
+  if (!Number.isFinite(writeTimeoutMs) || writeTimeoutMs < 5000 || writeTimeoutMs > 300_000) missing.push("NDFC_WRITE_TIMEOUT_MS must be between 5000 and 300000");
 
   return {
     missing,
@@ -93,6 +104,7 @@ export function loadNdfcConfig(env) {
       tlsMode,
       caPem: caPem || null,
       timeoutMs,
+      writeTimeoutMs,
     },
   };
 }
@@ -132,10 +144,23 @@ function upstreamMessage(text, status) {
     if (typeof data.message === "string" && data.message.trim()) return clip(data.message);
     if (typeof data.messages?.[0]?.message === "string") return clip(data.messages[0].message);
   }
+  // Some refusals are one plain sentence ("Switch(es) are either reloading or
+  // not reachable ..."). A page of HTML from a proxy is not a message.
+  const plain = typeof text === "string" ? text.trim() : "";
+  if (!data && plain && plain.length <= 400 && !/[<>{}]/.test(plain)) return clip(plain);
   return `The controller answered HTTP ${status}.`;
 }
 
-export function createNdfcClient(config, { now = () => Date.now() } = {}) {
+/** Path hygiene shared by reads and writes: an absolute path below the API base, no query, no dot segments. */
+function assertCleanPath(raw) {
+  if (!raw.startsWith("/") || raw.includes("\\") || /[?#]/.test(raw) || raw.split("/").some((s) => s === "." || s === ".." || [".", ".."].includes(safeDecode(s)))) {
+    throw new ToolError(400, "invalid_path", "The tool built an invalid API path.");
+  }
+}
+
+export function createNdfcClient(config, { now = () => Date.now(), writeEndpoints = [] } = {}) {
+  // The write routes this client may send. Empty for a read-only server.
+  const allowedWrites = new Set(writeEndpoints);
   const base = new URL(config.origin);
   const lib = base.protocol === "https:" ? https : http;
   const tls =
@@ -205,7 +230,7 @@ export function createNdfcClient(config, { now = () => Date.now() } = {}) {
 
   let token = null; // { value, expiresAt }
   let loginInFlight = null;
-  const stats = { logins: 0, loginFailures: 0, lastLoginAt: null, lastLoginError: null };
+  const stats = { logins: 0, loginFailures: 0, lastLoginAt: null, lastLoginError: null, writes: 0, writeFailures: 0 };
 
   async function login() {
     stats.logins += 1;
@@ -271,9 +296,7 @@ export function createNdfcClient(config, { now = () => Date.now() } = {}) {
   async function get(endpoint, path, query = {}) {
     const raw = String(path);
     if (!/^GET\s/.test(String(endpoint))) throw new ToolError(500, "endpoint_mismatch", "The tool declared an endpoint that is not a GET.");
-    if (!raw.startsWith("/") || raw.includes("\\") || /[?#]/.test(raw) || raw.split("/").some((s) => s === "." || s === ".." || [".", ".."].includes(safeDecode(s)))) {
-      throw new ToolError(400, "invalid_path", "The tool built an invalid API path.");
-    }
+    assertCleanPath(raw);
     if (!matchesEndpoint(raw, endpoint)) throw new ToolError(500, "endpoint_mismatch", "The tool tried to call a route other than its declared endpoint.");
     const qs = new URLSearchParams();
     for (const [k, v] of Object.entries(query)) if (v !== undefined && v !== null && v !== "") qs.set(k, String(v));
@@ -296,8 +319,58 @@ export function createNdfcClient(config, { now = () => Date.now() } = {}) {
     }
   }
 
+  /**
+   * Send ONE write. `endpoint` is the calling tool's declared endpoint
+   * ("POST /path/{param}"), and it must be on this client's write list; `path`
+   * is that template filled in; `body` was built by the tool from validated
+   * arguments. Resolves the parsed JSON answer, or the text of a plain one.
+   */
+  async function send(endpoint, path, { query = {}, body } = {}) {
+    const raw = String(path);
+    const method = String(endpoint).split(/\s+/)[0];
+    if (!["POST", "PUT", "DELETE"].includes(method)) throw new ToolError(500, "endpoint_mismatch", "The tool declared a write endpoint that is not a POST, PUT or DELETE.");
+    if (!allowedWrites.has(String(endpoint))) throw new ToolError(403, "write_not_allowed", "This server is not configured to change the controller.");
+    assertCleanPath(raw);
+    if (!matchesEndpoint(raw, endpoint)) throw new ToolError(500, "endpoint_mismatch", "The tool tried to call a route other than its declared endpoint.");
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(query)) if (v !== undefined && v !== null && v !== "") qs.set(k, String(v));
+    const target = `${API_BASE_PATH}${raw}${qs.size ? `?${qs}` : ""}`;
+
+    stats.writes += 1;
+    let res;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      // A failed login, or a controller that cannot be reached for it, is before the write: nothing was sent.
+      const bearer = await getToken();
+      try {
+        res = await request(method, target, { headers: { Authorization: `Bearer ${bearer}` }, body, timeoutMs: config.writeTimeoutMs });
+      } catch (e) {
+        // Once the request has left, a timeout or a cut connection says nothing about what the controller did.
+        if (e instanceof UpstreamError && (e.code === "upstream_timeout" || e.code === "upstream_unreachable" || e.code === "upstream_too_large")) {
+          stats.writeFailures += 1;
+          throw new UpstreamError(504, "write_outcome_unknown", e.code === "upstream_timeout" ? "The controller did not answer the change in time." : "The connection to the controller broke while the change was being sent.");
+        }
+        stats.writeFailures += 1;
+        throw e;
+      }
+      // 401 is the controller refusing the session before it acts: one fresh login, one retry.
+      if (res.status !== 401 || attempt === 1) break;
+      token = null;
+    }
+    if (res.status < 200 || res.status >= 300) {
+      stats.writeFailures += 1;
+      throw new UpstreamError(res.status, res.status === 401 || res.status === 403 ? "controller_refused" : res.status >= 500 ? "controller_error" : "controller_refused_change", upstreamMessage(res.text, res.status));
+    }
+    try {
+      return res.text ? JSON.parse(res.text) : null;
+    } catch {
+      return res.text; // several write routes answer one plain sentence
+    }
+  }
+
   return {
     get,
+    send,
+    canWrite: () => allowedWrites.size > 0,
     stats: () => ({ ...stats, tokenCached: Boolean(token && token.expiresAt - TOKEN_MARGIN_MS > now()) }),
     close: () => agent.destroy(),
   };

@@ -19,6 +19,23 @@ services:
       NDFC_TLS_CA_PEM: ${NDFC_TLS_CA_PEM:-}
       NDFC_TLS_INSECURE: ${NDFC_TLS_INSECURE:-}
       NDFC_MCP_MODE: ${NDFC_MCP_MODE:-local}
+      # read (the default): the write tools are not offered and the server
+      # cannot send a change. write: it can create, attach, deploy and delete
+      # VRFs and networks.
+      NDFC_MCP_ACCESS: ${NDFC_MCP_ACCESS:-read}
+      NDFC_WRITE_TIMEOUT_MS: ${NDFC_WRITE_TIMEOUT_MS:-90000}
+      # Gateway mode only (README, "Behind a gateway"): who vouches for the
+      # caller, who may hand out write access, and where the grants are kept.
+      NDFC_MCP_SLUG: ${NDFC_MCP_SLUG:-}
+      NDFC_MCP_CP_URL: ${NDFC_MCP_CP_URL:-}
+      NDFC_MCP_ASSERTION_PUBLIC_KEY: ${NDFC_MCP_ASSERTION_PUBLIC_KEY:-}
+      NDFC_MCP_ASSERTION_SECRET: ${NDFC_MCP_ASSERTION_SECRET:-}
+      NDFC_MCP_ADMIN_EMAILS: ${NDFC_MCP_ADMIN_EMAILS:-}
+      NDFC_MCP_DATA_DIR: ${NDFC_MCP_DATA_DIR:-}
+    # The grants of a gateway-mode server (NDFC_MCP_DATA_DIR=/data). Empty and
+    # unused otherwise; the rest of the container's filesystem stays read-only.
+    volumes:
+      - ndfc-mcp-data:/data
     # 127.0.0.1 only: nothing off this machine can reach it.
     ports:
       - "127.0.0.1:${NDFC_MCP_HOST_PORT:-3300}:3300"
@@ -27,3 +44,6 @@ services:
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
+
+volumes:
+  ndfc-mcp-data:
