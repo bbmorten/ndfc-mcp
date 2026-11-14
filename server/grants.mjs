@@ -20,10 +20,12 @@
  *               calling the three grant tools as an administrator.
  *
  * The grants live in ONE file, <NDFC_MCP_DATA_DIR>/grants.json, written whole
- * and atomically; every change is also appended to changelog.ndjson with who
- * made it. Neither file holds a secret. A grant that cannot be stored is
- * refused, never kept in memory only: a role that vanishes at the next restart
- * is worse than an error now.
+ * and atomically; every change is first appended to changelog.ndjson with who
+ * made it (their address and the subject of their assertion). Neither file
+ * holds a secret. A grant that cannot be stored or logged is refused, never
+ * kept in memory only: a role that vanishes at the next restart is worse than
+ * an error now. The file is re-read when it changes behind the server, so a
+ * hand edit or a second server on the directory is honoured, not overwritten.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -36,7 +38,17 @@ const RANK = { read: 0, write: 1, admin: 2 };
 export const roleAllows = (have, need) => (RANK[have] ?? -1) >= (RANK[need] ?? 99);
 
 const EMAIL = "^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,180}\\.[A-Za-z]{2,24}$";
+const EMAIL_RE = new RegExp(EMAIL, "u");
+/** A configured or tool-supplied address (already held to the pattern), in the one form the store keeps. */
 const normEmail = (e) => String(e || "").trim().toLowerCase();
+/**
+ * An address as an assertion or the grants file carries it. It is matched AS
+ * RECEIVED against the pattern the grant tools enforce, and only then
+ * lower-cased: trimming first, or lower-casing first, would let a string that
+ * is not the granted address (a no-break space after it, a Kelvin sign for a
+ * k) resolve to that person's role.
+ */
+const claimEmail = (e) => (typeof e === "string" && e.length <= 254 && EMAIL_RE.test(e) ? e.toLowerCase() : null);
 
 /** Read the access settings. Returns { config, missing[] }. */
 export function loadAccessConfig(env, mode) {
@@ -48,7 +60,7 @@ export function loadAccessConfig(env, mode) {
     .map(normEmail)
     .filter(Boolean);
   const dataDir = (env.NDFC_MCP_DATA_DIR || "").trim();
-  const badAdmin = adminEmails.find((e) => !new RegExp(EMAIL, "u").test(e));
+  const badAdmin = adminEmails.find((e) => !EMAIL_RE.test(e));
   if (badAdmin) missing.push("NDFC_MCP_ADMIN_EMAILS holds something that is not an e-mail address");
   if (mode === "gateway" && access === "write") {
     // Under a write ceiling someone has to be able to hand out the write role.
@@ -66,83 +78,156 @@ export function loadAccessConfig(env, mode) {
 }
 
 /**
- * The grant store (gateway mode under a write ceiling). Reads the file once;
- * every change rewrites it and appends to the changelog.
+ * The grant store (gateway mode under a write ceiling). The file is the
+ * truth: it is read at start and again whenever it has changed behind this
+ * process (a hand edit, another server on the same directory), and every
+ * change appends to the changelog and then replaces the file.
  */
 export function createGrantStore({ dataDir, adminEmails = [], now = () => Date.now() }) {
   const file = path.join(dataDir, "grants.json");
   const logFile = path.join(dataDir, "changelog.ndjson");
   const admins = new Set(adminEmails.map(normEmail));
-  let grants = new Map(); // email -> { role, by, at }
+  let grants = new Map(); // email -> { role, by, bySub, at }
   let loadError = null;
+  let ignored = 0; // entries of the file that are not an address with a role
+  let seen = null; // what grants.json looked like when it was last read or written
 
-  try {
-    if (fs.existsSync(file)) {
+  const signature = () => {
+    try {
+      const st = fs.statSync(file);
+      return `${st.ino}:${st.size}:${st.mtimeMs}`;
+    } catch (e) {
+      return e?.code === "ENOENT" ? "absent" : `unreadable:${e?.code || "error"}`;
+    }
+  };
+
+  function load() {
+    seen = signature();
+    grants = new Map();
+    loadError = null;
+    ignored = 0;
+    try {
+      if (!fs.existsSync(file)) return;
       const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-      const rows = parsed && typeof parsed === "object" && parsed.grants && typeof parsed.grants === "object" ? parsed.grants : null;
+      const rows = parsed && typeof parsed === "object" && parsed.grants && typeof parsed.grants === "object" && !Array.isArray(parsed.grants) ? parsed.grants : null;
       if (!rows) throw new Error("no grants object");
       for (const [email, g] of Object.entries(rows)) {
-        if (ROLES.includes(g?.role)) grants.set(normEmail(email), { role: g.role, by: String(g.by || ""), at: String(g.at || "") });
+        const key = claimEmail(email);
+        // An entry the grant tools could not have written is not honoured, and /healthz counts it.
+        if (!key || !ROLES.includes(g?.role)) {
+          ignored += 1;
+          continue;
+        }
+        grants.set(key, { role: g.role, by: String(g.by || ""), bySub: String(g.bySub || ""), at: String(g.at || "") });
       }
+    } catch (e) {
+      // A grants file that cannot be read gives nobody a role it might not hold:
+      // everyone reads, the administrators named in the environment still manage.
+      loadError = e?.message || "unreadable";
+      grants = new Map();
     }
-  } catch (e) {
-    // A grants file that cannot be read gives nobody a role it might not hold:
-    // everyone reads, the administrators named in the environment still manage.
-    loadError = e?.message || "unreadable";
-    grants = new Map();
   }
+  load();
+  const refresh = () => {
+    if (signature() !== seen) load();
+  };
 
   function persist(entry) {
-    const rows = Object.fromEntries([...grants.entries()].sort(([a], [b]) => a.localeCompare(b)));
+    const rows = Object.fromEntries(
+      [...grants.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([email, g]) => [email, { role: g.role, by: g.by, ...(g.bySub ? { bySub: g.bySub } : {}), at: g.at }])
+    );
     const tmp = `${file}.${process.pid}.tmp`;
+    let logged = false;
     try {
       fs.mkdirSync(dataDir, { recursive: true });
       fs.writeFileSync(tmp, `${JSON.stringify({ version: 1, grants: rows }, null, 2)}\n`, { mode: 0o600 });
-      fs.renameSync(tmp, file);
+      // The changelog line goes in BEFORE the file is replaced: when it cannot
+      // be written, grants.json is untouched and "nothing was changed" is true.
       fs.appendFileSync(logFile, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
+      logged = true;
+      fs.renameSync(tmp, file);
       loadError = null;
+      seen = signature();
     } catch (e) {
       try {
         fs.rmSync(tmp, { force: true });
       } catch {
         // nothing to clean up
       }
+      if (logged) {
+        // The line is in and the file is not: say so in the changelog, so it never records a change that did not happen.
+        try {
+          fs.appendFileSync(logFile, `${JSON.stringify({ at: entry.at, actor: entry.actor, action: "not_stored", of: entry.action, email: entry.email })}\n`, { mode: 0o600 });
+        } catch {
+          // the tool's error below is what the administrator reads
+        }
+      }
       throw new ToolError(500, "grants_not_stored", `The grant could not be stored (${e?.code || "write failed"}): the server's data directory is not writable. Nothing was changed.`);
     }
   }
 
+  const actorOf = (actor) => ({ actor: claimEmail(actor?.email) || "", ...(actor?.sub ? { actorSub: String(actor.sub).slice(0, 128) } : {}) });
+  const RANK_FIRST = { admin: 0, write: 1, read: 2 };
+
   return {
-    /** The role of a verified caller. No e-mail in the assertion means no grant can match: read. */
+    /** The role of a verified caller. An assertion without an address, or with something that is not one, matches no grant: read. */
     roleOf(email) {
-      const e = normEmail(email);
+      refresh();
+      const e = claimEmail(email);
       if (!e) return "read";
       if (admins.has(e)) return "admin";
       return grants.get(e)?.role || "read";
     },
+    /** Administrators by configuration, then every stored grant: admin, write, read, each by address. */
     list() {
+      refresh();
       return [
         ...[...admins].sort().map((email) => ({ email, role: "admin", source: "server configuration" })),
         ...[...grants.entries()]
-          .filter(([email]) => !admins.has(email))
-          .sort(([a], [b]) => a.localeCompare(b))
-          .map(([email, g]) => ({ email, role: g.role, source: "grant", grantedBy: g.by || undefined, grantedAt: g.at || undefined })),
+          .sort(([a, ga], [b, gb]) => RANK_FIRST[ga.role] - RANK_FIRST[gb.role] || a.localeCompare(b))
+          .map(([email, g]) => ({
+            email,
+            role: g.role,
+            // A stored grant under a configured administrator has no effect today, and would the day they leave the configuration.
+            source: admins.has(email) ? "grant (not in effect: an administrator by server configuration)" : "grant",
+            grantedBy: g.by || undefined,
+            grantedAt: g.at || undefined,
+          })),
       ];
     },
     set(email, role, actor) {
+      refresh();
       const e = normEmail(email);
+      let setAside = null;
+      if (loadError) {
+        // A new grant is the repair of an unreadable file. The file is kept
+        // under another name, never overwritten unseen.
+        setAside = `grants.json.unreadable-${new Date(now()).toISOString().replace(/[:.]/g, "-")}`;
+        try {
+          fs.renameSync(file, path.join(dataDir, setAside));
+        } catch (err) {
+          throw new ToolError(500, "grants_not_stored", `The unreadable grants file could not be set aside (${err?.code || "rename failed"}). Nothing was changed.`);
+        }
+      }
       const before = new Map(grants);
       const previous = grants.get(e)?.role || null;
       const at = new Date(now()).toISOString();
-      grants.set(e, { role, by: normEmail(actor), at });
+      const who = actorOf(actor);
+      grants.set(e, { role, by: who.actor, bySub: who.actorSub || "", at });
       try {
-        persist({ at, actor: normEmail(actor), action: "grant_set", email: e, role, previous });
+        persist({ at, ...who, action: "grant_set", email: e, role, previous, ...(setAside ? { setAside } : {}) });
       } catch (err) {
         grants = before;
         throw err;
       }
-      return { email: e, role, previous };
+      return { email: e, role, previous, setAside };
     },
     revoke(email, actor) {
+      refresh();
+      // A revoke that cannot be recorded would come back with the file.
+      if (loadError) {
+        throw new ToolError(409, "grants_suspended", "The grants file cannot be read, so every granted role is suspended and no grant can be revoked. Repair grants.json in the server's data directory, or use grant_set, which sets the unreadable file aside and starts a new one.");
+      }
       const e = normEmail(email);
       const previous = grants.get(e)?.role || null;
       if (!previous) return { email: e, previous: null };
@@ -150,7 +235,7 @@ export function createGrantStore({ dataDir, adminEmails = [], now = () => Date.n
       const at = new Date(now()).toISOString();
       grants.delete(e);
       try {
-        persist({ at, actor: normEmail(actor), action: "grant_revoke", email: e, previous });
+        persist({ at, ...actorOf(actor), action: "grant_revoke", email: e, previous });
       } catch (err) {
         grants = before;
         throw err;
@@ -158,12 +243,30 @@ export function createGrantStore({ dataDir, adminEmails = [], now = () => Date.n
       return { email: e, previous };
     },
     isConfiguredAdmin: (email) => admins.has(normEmail(email)),
-    stats: () => ({ grants: grants.size, administrators: admins.size, ...(loadError ? { loadError: "the grants file could not be read; every granted role is suspended" } : {}) }),
+    hasGrant(email) {
+      refresh();
+      return grants.has(normEmail(email));
+    },
+    /** True while grants.json cannot be read: every granted role is suspended. */
+    suspended() {
+      refresh();
+      return Boolean(loadError);
+    },
+    stats() {
+      refresh();
+      return {
+        grants: grants.size,
+        administrators: admins.size,
+        ...(ignored ? { ignoredEntries: ignored } : {}),
+        ...(loadError ? { loadError: "the grants file could not be read; every granted role is suspended" } : {}),
+      };
+    },
   };
 }
 
 const ADMIN = Object.freeze({ readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false });
 const EMAIL_ARG = { type: "string", pattern: EMAIL, maxLength: 254, description: "The person's e-mail address, as they sign in with it." };
+const actorFrom = (user) => ({ email: user.email, sub: user.userId });
 
 /**
  * The three grant tools. They touch this server's own grant file, never the
@@ -178,13 +281,27 @@ export const GRANT_TOOLS = [
     access: "admin",
     description:
       "ADMINISTRATION. Lists who holds a role on this server: the administrators named in the server's " +
-      "configuration, and every person granted read, write or admin. Anyone not listed has read access. It reads " +
-      "this server's own grant list, not the controller.",
+      "configuration, then every person granted admin, write or read. Anyone not listed has read access. role and " +
+      "emailContains narrow a long list. It reads this server's own grant list, not the controller.",
     annotations: Object.freeze({ readOnlyHint: true, openWorldHint: false }),
-    inputSchema: { type: "object", properties: {}, additionalProperties: false },
-    handler: async ({ store }) => {
-      const rows = store.list();
-      return { grants: rows, totalRows: rows.length, everyoneElse: "read" };
+    narrowHint: "Administrators and writers are listed first. Narrow the list with role or emailContains.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        role: { type: "string", enum: ROLES, description: "Keep only people who hold this role." },
+        emailContains: { type: "string", minLength: 1, maxLength: 64, description: "Keep only addresses that contain this text (case-insensitive)." },
+      },
+      additionalProperties: false,
+    },
+    handler: async ({ args, store }) => {
+      const needle = args.emailContains ? args.emailContains.toLowerCase() : null;
+      const rows = store.list().filter((r) => (!args.role || r.role === args.role) && (!needle || r.email.includes(needle)));
+      return {
+        grants: rows,
+        totalRows: rows.length,
+        everyoneElse: "read",
+        ...(store.suspended() ? { suspended: "The grants file cannot be read: every granted role is suspended and the grants stored in it are not listed. grant_set sets that file aside and starts a new one." } : {}),
+      };
     },
   },
   {
@@ -204,8 +321,14 @@ export const GRANT_TOOLS = [
     },
     handler: async ({ args, user, store }) => {
       if (store.isConfiguredAdmin(args.email)) throw new ToolError(409, "configured_administrator", "That person is an administrator by the server's configuration; a grant cannot change it.");
-      const r = store.set(args.email, args.role, user.email);
-      return { changed: r.previous !== r.role, email: r.email, role: r.role, previousRole: r.previous ?? "read (no grant)" };
+      const r = store.set(args.email, args.role, actorFrom(user));
+      return {
+        changed: r.previous !== r.role,
+        email: r.email,
+        role: r.role,
+        previousRole: r.previous ?? "read (no grant)",
+        ...(r.setAside ? { note: `The grants file could not be read. It was kept as ${r.setAside} and a new one was started: the grants stored in the old file are not in effect.` } : {}),
+      };
     },
   },
   {
@@ -214,12 +337,19 @@ export const GRANT_TOOLS = [
     access: "admin",
     description:
       "ADMINISTRATION. Removes one person's grant on this server, which leaves them with read access. It takes " +
-      "effect on their next call. An administrator named in the server's configuration cannot be revoked here.",
+      "effect on their next call. An administrator named in the server's configuration stays an administrator; " +
+      "a grant stored for them is removed, so that taking them out of the configuration leaves them with read.",
     annotations: ADMIN,
     inputSchema: { type: "object", properties: { email: EMAIL_ARG }, required: ["email"], additionalProperties: false },
     handler: async ({ args, user, store }) => {
-      if (store.isConfiguredAdmin(args.email)) throw new ToolError(409, "configured_administrator", "That person is an administrator by the server's configuration; remove them from NDFC_MCP_ADMIN_EMAILS instead.");
-      const r = store.revoke(args.email, user.email);
+      const configured = store.isConfiguredAdmin(args.email);
+      if (configured && !store.hasGrant(args.email)) {
+        throw new ToolError(409, "configured_administrator", "That person is an administrator by the server's configuration and holds no stored grant; remove them from NDFC_MCP_ADMIN_EMAILS instead.");
+      }
+      const r = store.revoke(args.email, actorFrom(user));
+      if (configured) {
+        return { changed: true, email: r.email, role: "admin", previousRole: r.previous, note: "Still an administrator by the server's configuration (NDFC_MCP_ADMIN_EMAILS). The stored grant is gone, so removing them from that setting now leaves them with read access." };
+      }
       return { changed: r.previous !== null, email: r.email, role: "read", previousRole: r.previous ?? "read (no grant)" };
     },
   },

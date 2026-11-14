@@ -31,7 +31,7 @@ These are always there, and none of them changes anything:
 | `list_vrfs`, `list_networks` | The VRFs and overlay networks of a fabric |
 | `list_vrf_attachments`, `list_network_attachments` | Which switches a VRF or network is attached to, and its state on each (`NA`, `PENDING`, `DEPLOYED`, …) |
 | `list_alarms` | What is alarming, where, since when |
-| `list_deploy_history` | What the controller deployed, to which switch, with what outcome |
+| `list_deploy_history` | What the controller deployed, to which switch, with what outcome; newest first, at most 200 rows from the controller, so name the switch |
 
 Start with `list_fabrics` (it gives the fabric names the others take) and `list_switches` (it
 gives the serial numbers).
@@ -301,16 +301,39 @@ What a change is, here:
 - **Names and numbers, never configuration text.** A write tool takes a fabric, a name, a VNI, a
   VLAN, a gateway address, switch ports and a plain-text description. It takes no template name,
   no free-form configuration and no raw request body, and every string is held to a pattern that
-  admits no newline, quote or command separator. Each tool sends one request to one route.
+  admits no newline, quote or command separator. Each tool sends one change to one route. Some
+  read first: a create reads the template's default values from the controller and sends them
+  under its own (without them the switch gets the template's placeholders, such as
+  `ip address 192.0.2.1/24 tag $$tag$$`, and refuses the gateway), and without an id it reads
+  the controller's next free one; taking ports out of a network reads its attachment, because
+  that request sent for a switch the network is not on would attach it there. `default`,
+  `management` and `NA` are refused as VRF names.
 - **Only these routes.** The controller documents 385 write operations; this server can send
   the ten its tools declare. Policies, interfaces, templates, switch discovery, credentials and
   every bulk or import route are out of reach.
-- **Every change is in the log** with who asked and what for:
-  `tool=create_vrf user=local access=write args="{…}" outcome=ok`.
+- **Every change is in the log** with who asked and what for, twice: a `tool call started` line
+  before it is sent, and the outcome,
+  `tool=create_vrf user=local access=write args="{…}" outcome=ok`. A container stopped while a
+  change is at the controller waits for the answer (up to two minutes) and says so in the log.
 - **An error says whether anything changed.** A refusal by the controller is
-  `controller_refused_change` with its reason and "nothing was changed". A controller that did
-  not answer in time is `write_outcome_unknown`: the change may or may not have been applied, so
-  the state is read before anything is tried again. A write is never repeated on its own.
+  `controller_refused_change` with its reason and "nothing was changed"; so is a failure before
+  the change was sent (the login, the connection, a read the tool makes first). A change that
+  was sent and whose answer did not arrive or was not the controller's (a timeout, a cut
+  connection, a redirect, a page of HTML) is `write_outcome_unknown`: it may or may not have
+  been applied, so the state is read before anything is tried again. An attach that the
+  controller saved for one switch and refused for another is `write_partly_applied`. A write is
+  never repeated on its own.
+- **A deploy result says `accepted`, not `changed`, and then how the switches ended.** The
+  controller answers a deployment when it has taken the request. `deploy_vrf` and
+  `deploy_network` then read the object's attachments every 3 s until no switch is `PENDING` or
+  `IN PROGRESS` (`waitSeconds`, default 60, at most 90; 0 does not wait) and return each
+  switch's state as `outcome`, with `settled: false` and the busy switches when the wait ran
+  out. Deploy one object at a time: on the sandbox (2026-11-14), three networks deployed one
+  right after another left one of them `OUT-OF-SYNC`, its `member vni` line on `nve1` never
+  sent. The commands' outcomes are in `list_deploy_history`.
+- **The last network takes its VRF along.** On the sandbox, a deployment that removed the last
+  network of a VRF from a switch removed the VRF there too (`no vrf context …`), and a
+  `detach_vrf` after it was refused: *is already in detached state*.
 
 In local mode, the mode you get on your own machine, whoever holds the API key may use the write
 tools. Deploying configures switches in a running network: give the server write access on a
@@ -337,14 +360,27 @@ call them:
 
 | Tool | Does |
 | --- | --- |
-| `grant_list` | Who holds which role; everyone else reads |
+| `grant_list` | Who holds which role, administrators and writers first (`role` and `emailContains` narrow it); everyone else reads |
 | `grant_set` | Gives one person `read`, `write` or `admin` |
 | `grant_revoke` | Removes a person's grant, which leaves them with read |
 
 A person without the role who calls a write tool gets `write_not_allowed` and nothing happens.
 Grants are kept in `grants.json` under `NDFC_MCP_DATA_DIR`, with every change in
-`changelog.ndjson` beside it; neither holds a secret. With `NDFC_MCP_ACCESS` left at `read`, a
-gateway-mode server is read-only for everyone, whatever was granted.
+`changelog.ndjson` beside it (who made it, by address and by the subject of their sign-in);
+neither holds a secret. With `NDFC_MCP_ACCESS` left at `read`, a gateway-mode server is
+read-only for everyone, whatever was granted. A few rules of the grant file:
+
+- The address is compared as the gateway sends it, lower-cased. An address with a stray space
+  or a look-alike letter is nobody.
+- The file is read again whenever it changes, so an edit by hand takes effect on the next call
+  and is not overwritten. An entry that is not an address with a role is ignored, and
+  `/healthz` counts it (`ignoredEntries`).
+- A file that cannot be read suspends every grant. `/healthz` and `grant_list` say so,
+  `grant_revoke` refuses, and `grant_set` keeps the unreadable file as
+  `grants.json.unreadable-<time>` and starts a new one.
+- A person named in `NDFC_MCP_ADMIN_EMAILS` stays an administrator whatever is granted. If
+  they also hold a stored grant, `grant_list` shows it and `grant_revoke` removes it, so that
+  taking them out of the setting leaves them with read.
 
 ## The VPN sidecar
 
@@ -408,29 +444,42 @@ docker compose down                   # stop; the tunnel closes with it
 | HTTP 403 | The request carried an `Origin` header (it came from a web page) | Call it from an MCP client, not a browser |
 | `truncated: true` in an answer | The list did not fit one tool result | Ask again with the filter the answer names |
 | `unknown tool: create_vrf` (or another write tool) | The server is read-only | Set `NDFC_MCP_ACCESS=write`; see [Write access](#write-access) |
+| A client still lists only the read tools after `NDFC_MCP_ACCESS=write` (aimo's Tool Servers shows every tool as `read-only`) | The client is showing the tool list it stored when the server was read-only | Over stdio the server announces its tool list at every start, so use the server once from a chat (any question that calls it) and the list is read again. An HTTP client reads the list when it reconnects |
 | Tool error `write_not_allowed` | Behind a gateway: the caller has no write grant | An administrator runs `grant_set` for them |
 | Tool error `controller_refused_change` | The controller refused the change; nothing changed | The message is the controller's reason: the object exists, is still attached, is under deployment, or the switch cannot take it |
 | Tool error `controller_refused`, HTTP 403, on a write | The controller account may not write | Give `NDFC_USERNAME` a role that may (`network-admin`) |
-| Tool error `write_outcome_unknown` | The controller did not answer a change within `NDFC_WRITE_TIMEOUT_MS` (90 s) | Read the state (`list_vrf_attachments`, `list_deploy_history`) before retrying. A deployment to a switch the controller cannot reach does this |
+| Tool error `write_outcome_unknown` | A change was sent and its answer did not arrive within `NDFC_WRITE_TIMEOUT_MS` (90 s), or the connection broke, or the answer was not the controller's | Read the state (`list_vrf_attachments`, `list_deploy_history`) before retrying. A deployment to a switch the controller cannot reach does this, and so can `deploy_fabric_config` on a fabric whose switches were all just reset: on the sandbox (2026-11-14) it ran past 90 s and finished on its own two minutes later |
+| An attachment is `OUT-OF-SYNC` after several networks were deployed one right after another | A deployment sent while another was still running on the same switch: on the sandbox (2026-11-14) the later network's `member vni` line on `nve1` was never sent | Deploy one object at a time, the next only when the previous one's `outcome.settled` is true (the deploy tools wait for it). `recalculate_fabric_config` and `deploy_fabric_config` brought the switch back in sync |
+| Tool error `write_partly_applied` | The controller saved an attach or detach for one switch and refused it for another | The message names both. Read `list_vrf_attachments` or `list_network_attachments` before a deploy |
+| The VPN connects and drops every 10 to 15 seconds (`Internal Error` in `docker compose logs vpn`) | Another client is signed in with the same VPN login: some gateways, the DevNet sandbox's among them, keep one session per login, and the two knock each other off | Stop the other client (another copy of this stack, a VPN app, another machine), or use a second login |
 | `Delete is not allowed as the Network is under a Deployment operation` | A detach is still `PENDING` | Deploy it first; while the switch is unreachable the controller keeps the object |
 
 ## Tests
 
 ```bash
-node test/verify-local.mjs    # 294 checks against a stub controller; no network, no credentials
+node test/verify-local.mjs    # 350 checks against a stub controller; no network, no credentials
 node test/live-check.mjs      # every read tool against the real controller in .env (run where node can reach it)
 node test/live-check.mjs --write            # also the roles, and a VRF and a network created and deleted
 node test/live-check.mjs --write --deploy   # also attached to a leaf, deployed, detached, deployed
 ```
 
-Both need only Node.js 20 or later; the server has no npm dependencies. Without `--write` the
+Both need only Node.js 20 or later; the server has no npm dependencies. The live check needs
+the controller reachable from where node runs. When only the VPN sidecar reaches it, run the
+check inside the stack's network instead of opening a second VPN session:
+
+```bash
+docker run --rm --network container:ndfc-mcp-vpn-1 -v "$PWD":/src:ro --entrypoint node \
+  ndfc-mcp:local /src/test/live-check.mjs --env /src/.env
+```
+ Without `--write` the
 live check changes nothing. `--write` creates `MCPCHK_VRF` and `MCPCHK_NET` and deletes them
-again; `--deploy` configures one leaf and is skipped when the controller does not reach it. Run
-those two against a lab. `--url <origin>` replaces the controller address, for a port forward.
+again; `--deploy` configures one leaf and is skipped when the controller does not reach it. A
+run that stops half way removes what it made before it exits, and says what it could not
+remove. Run those two against a lab. `--url <origin>` replaces the controller address, for a port forward.
 
 ## Status
 
-Version 0.3.0. Version 0.2.0 was verified on 2026-11-12 against the DevNet sandbox (NDFC 12.2.2
+Version 0.3.1. Version 0.2.0 was verified on 2026-11-12 against the DevNet sandbox (NDFC 12.2.2
 on Nexus Dashboard 3.2): the twelve read tools it had, both transports with Claude Code, the
 image run read-only without capabilities, the CA pin, and the VPN sidecar — it logged in to the
 sandbox's AnyConnect gateway (group `SSLClient`, DTLS), took the split-tunnel routes, and the
@@ -447,6 +496,23 @@ leaves; `deploy_network` ended as `write_outcome_unknown`, and the `--deploy` cy
 itself. The answer of a successful `deploy_*` or `deploy_fabric_config` is therefore taken from
 Cisco's API document, not seen. No MCP client was driven with the write tools, and the server
 was not run behind a real gateway: the grants were exercised with assertions signed by the tests.
+
+0.3.1 (2026-11-14) fixes what an independent review of 0.3.0 found, none of it rated high: how
+an error tells "not sent" from "outcome unknown", a request that could stop the server, the
+ports-only detach, the grant file's edge cases, hidden text in results. It was verified the
+same day with the compose stack and its VPN sidecar in write mode: a VRF created, read back
+and deleted over HTTP, the same by Claude Code as the MCP client over stdio, and
+`live-check.mjs --write` all passing with the CA pinned.
+
+Later the same day, with the sandbox's switches rebuilt and reachable, **deployments were seen
+succeed**: a fabric recalculate and deploy, then nineteen prompts run by Claude Code over stdio,
+each in a new conversation (VRFs and networks created, attached to two leaves and the border
+with ports, deployed, a port moved between leaves, everything detached, deployed and deleted;
+six refusals). They found three faults, fixed in 0.3.1 before the final run: a create left the
+template's defaults out (the switches refused `ip address … tag $$tag$$`), the deployment
+history returned the controller's oldest rows, and deployments sent back to back left a switch
+out of sync, which is why the deploy tools now wait for the switches. Harness 350/350. **Still
+not verified:** a real gateway.
 
 On Windows 11 with Docker Desktop (same day): the 175 checks pass, and `.\setup` built and
 started the server without the sidecar, saw it healthy, and reached it over HTTP and over stdio

@@ -53,10 +53,21 @@ case "$MODE" in
       log error "VPN_MODE=proxy needs VPN_FORWARDS (lport:host:rport, space-separated): without a forward nothing reaches the VPN"
       exit 1
     fi
+    # A port is a whole number from 1 to 65535: checked before the login, so a
+    # typo never takes the gateway's one session for a forward that cannot work.
+    port_ok() {
+      case "$1" in ''|*[!0-9]*|0*|??????*) return 1 ;; esac
+      [ "$1" -le 65535 ]
+    }
     for f in $VPN_FORWARDS; do
       case "$f" in
         *[!0-9A-Za-z.:-]*|*:*:*:*) log error "VPN_FORWARDS entry is not lport:host:rport: $f"; exit 1 ;;
-        [0-9]*:?*:[0-9]*) ;;
+        *:*:*)
+          fwd_lport=${f%%:*}; fwd_rport=${f##*:}; fwd_host=${f#*:}; fwd_host=${fwd_host%:*}
+          if ! port_ok "$fwd_lport" || ! port_ok "$fwd_rport" || [ -z "$fwd_host" ]; then
+            log error "VPN_FORWARDS entry is not lport:host:rport: $f"; exit 1
+          fi
+          ;;
         *) log error "VPN_FORWARDS entry is not lport:host:rport: $f"; exit 1 ;;
       esac
     done

@@ -25,6 +25,10 @@
  *           does not report that leaf as reachable: an attachment that cannot
  *           be deployed stays PENDING and blocks the deletes.
  *
+ * A --write run that stops half way (a failed read, a crash) runs a teardown
+ * before it exits: detach and deploy if it had attached, then the two deletes,
+ * each step best effort, and it prints what is still on the controller.
+ *
  * Reads the controller address and login from an env file (never printed):
  *   NEXUS_DASHBOARD_URL / NEXUS_DASHBOARD_USERNAME / NEXUS_DASHBOARD_PASSWORD
  *   (or NDFC_URL / NDFC_USERNAME / NDFC_PASSWORD).
@@ -271,6 +275,9 @@ try {
     const vrfNames = async () => ((await call("list_vrfs", { fabricName })).data?.vrfs || []).map((v) => v.vrfName);
     const netNames = async () => ((await call("list_networks", { fabricName })).data?.networks || []).map((v) => v.networkName);
     const line = (r) => (r.isError ? `${r.data?.error} httpStatus ${r.data?.httpStatus}: ${r.data?.message}` : JSON.stringify(r.data));
+    // What this run may have left on the controller, for the teardown in the finally below.
+    const left = { vrf: false, net: false, leaf: null };
+    try {
 
     console.log("\nroles (gateway mode, NDFC_MCP_ACCESS=write)");
     const before = { vrfs: await vrfNames(), nets: await netNames() };
@@ -287,11 +294,13 @@ try {
       ok(`${VRF} / ${NET} do not exist before the run`, false, "left over from an earlier run: delete them on the controller, then run again");
       throw new Error("leftover");
     }
+    left.vrf = true;
     const mkVrf = await call("create_vrf", { fabricName, vrfName: VRF, description: "ndfc-mcp live-check" }, WRITER_EMAIL);
     ok("create_vrf", !mkVrf.isError && mkVrf.data?.changed === true, `${line(mkVrf)} (${mkVrf.ms} ms)`);
     ok("list_vrfs shows it", (await vrfNames()).includes(VRF));
     const dup = await call("create_vrf", { fabricName, vrfName: VRF }, WRITER_EMAIL);
     ok("creating it again is the controller's refusal, as an error result", dup.isError && dup.data?.error === "controller_refused_change", line(dup));
+    left.net = true;
     const mkNet = await call("create_network", { fabricName, networkName: NET, vrfName: VRF, gatewayIpAddress: "192.0.2.1/24", description: "ndfc-mcp live-check" }, WRITER_EMAIL);
     ok("create_network", !mkNet.isError && mkNet.data?.changed === true, `${line(mkNet)} (${mkNet.ms} ms)`);
     ok("list_networks shows it", (await netNames()).includes(NET));
@@ -308,15 +317,21 @@ try {
     }
 
     if (doDeploy) {
-      const leaf = (await call("list_switches", { fabricName })).data.switches.find((s) => s.role === "leaf");
+      const leaf = ((await call("list_switches", { fabricName })).data?.switches || []).find((s) => s.role === "leaf");
       if (!leaf || leaf.status !== "ok") {
         console.log(`  – deploy cycle SKIPPED: ${leaf ? `${leaf.hostName} is "${leaf.status}"` : "no leaf"} — an attachment that cannot be deployed stays PENDING and blocks the deletes`);
       } else {
         console.log(`\ndeploy cycle on ${leaf.hostName} (${leaf.serialNumber}) — THIS CONFIGURES THE SWITCH`);
+        left.leaf = leaf.serialNumber;
+        // A read that fails while the controller is deploying is "state unknown": poll again, never crash.
+        const rowOf = async (tool, a) => {
+          const r = await call(tool, a);
+          return r.isError || !Array.isArray(r.data?.attachments) ? null : r.data.attachments.find((x) => x.serialNumber === leaf.serialNumber) || {};
+        };
         const state = async () => {
-          const a = (await call("list_vrf_attachments", { fabricName, vrfName: VRF })).data.attachments.find((x) => x.serialNumber === leaf.serialNumber);
-          const b = (await call("list_network_attachments", { fabricName, networkName: NET })).data.attachments.find((x) => x.serialNumber === leaf.serialNumber);
-          return `vrf ${a?.attached}/${a?.state}, network ${b?.attached}/${b?.state}`;
+          const a = await rowOf("list_vrf_attachments", { fabricName, vrfName: VRF });
+          const b = await rowOf("list_network_attachments", { fabricName, networkName: NET });
+          return `vrf ${a ? `${a.attached}/${a.state}` : "unknown (the read failed)"}, network ${b ? `${b.attached}/${b.state}` : "unknown (the read failed)"}`;
         };
         const settle = async (want) => {
           for (let i = 0; i < 24; i += 1) {
@@ -349,13 +364,16 @@ try {
         }
         const down = await settle(/vrf false\/NA, network false\/NA/);
         ok("both are detached (NA) again", /vrf false\/NA, network false\/NA/.test(down), down);
+        if (/vrf false\/NA, network false\/NA/.test(down)) left.leaf = null;
       }
     }
 
     const rmNet = await call("delete_network", { fabricName, networkName: NET }, WRITER_EMAIL);
     ok("delete_network", !rmNet.isError && rmNet.data?.changed === true, `${line(rmNet)} (${rmNet.ms} ms)`);
+    if (!rmNet.isError) left.net = false;
     const rmVrf = await call("delete_vrf", { fabricName, vrfName: VRF }, WRITER_EMAIL);
     ok("delete_vrf", !rmVrf.isError && rmVrf.data?.changed === true, `${line(rmVrf)} (${rmVrf.ms} ms)`);
+    if (!rmVrf.isError) left.vrf = false;
     const after = { vrfs: await vrfNames(), nets: await netNames() };
     ok("the controller is as it was: the same VRFs and networks as before the run", JSON.stringify(after) === JSON.stringify(before), `VRFs ${after.vrfs.length}, networks ${after.nets.length}`);
     const gone = await call("delete_vrf", { fabricName, vrfName: VRF }, WRITER_EMAIL);
@@ -365,7 +383,32 @@ try {
     ok("the administrator revokes the grant", !revoked.isError && revoked.data?.role === "read");
     const again = await call("create_vrf", { fabricName, vrfName: VRF }, WRITER_EMAIL);
     ok("and the person is read-only again", again.isError && again.data?.error === "write_not_allowed");
-    ok("every change is in the server's log with who made it", lines.filter((l) => /access=write/.test(l) && /outcome=ok/.test(l)).every((l) => l.includes(`user=${WRITER_EMAIL}`)) && lines.some((l) => /tool=create_vrf .*access=write.*outcome=ok/.test(l)));
+    ok("every change is in the server's log with who made it, and was logged before it was sent", lines.filter((l) => /access=write/.test(l) && /outcome=ok/.test(l)).every((l) => l.includes(`user=${WRITER_EMAIL}`)) && lines.some((l) => /tool=create_vrf .*access=write.*outcome=ok/.test(l)) && lines.some((l) => /msg="tool call started" tool=create_vrf /.test(l)));
+    } finally {
+      // The run stopped before its own deletes: put the controller back as far as it lets us.
+      if (left.vrf || left.net) {
+        console.log("\nteardown after a run that did not finish (best effort, as the administrator)");
+        const attempt = async (tool, a) => {
+          try {
+            const r = await call(tool, a, ADMIN_EMAIL);
+            console.log(`  ${r.isError ? "✗" : "·"} ${tool}: ${line(r)}`);
+          } catch (e) {
+            console.log(`  ✗ ${tool}: ${e.message}`);
+          }
+        };
+        if (left.leaf) {
+          await attempt("detach_network", { fabricName, networkName: NET, serialNumber: left.leaf });
+          await attempt("deploy_network", { fabricName, networkName: NET });
+          await attempt("detach_vrf", { fabricName, vrfName: VRF, serialNumber: left.leaf });
+          await attempt("deploy_vrf", { fabricName, vrfName: VRF });
+          await new Promise((r) => setTimeout(r, 20_000)); // the controller refuses a delete while a deployment runs
+        }
+        if (left.net) await attempt("delete_network", { fabricName, networkName: NET });
+        if (left.vrf) await attempt("delete_vrf", { fabricName, vrfName: VRF });
+        const still = [...(await vrfNames().catch(() => [VRF])).filter((n) => n === VRF), ...(await netNames().catch(() => [NET])).filter((n) => n === NET)];
+        ok("the teardown removed the test objects", still.length === 0, still.length ? `STILL ON THE CONTROLLER: ${still.join(", ")} — detach, deploy and delete them there` : "");
+      }
+    }
   }
 
   console.log("\nwhat never appears in any result");

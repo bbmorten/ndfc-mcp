@@ -71,6 +71,10 @@ services:
     volumes:
       - ndfc-mcp-data:/data
     read_only: true
+    # A change that is at the controller when the container is stopped is
+    # waited for (the default write wait is 90 s) and logged; a container with
+    # no change in flight still stops at once.
+    stop_grace_period: 2m
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true

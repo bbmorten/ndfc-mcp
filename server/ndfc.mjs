@@ -13,8 +13,10 @@
  *   accepts only the endpoints handed to createNdfcClient as `writeEndpoints`.
  *   A read-only server hands it none, so that client cannot send a write
  *   whatever calls it. A write is never repeated on its own: the one retry is
- *   after a 401, which the controller answers before it does anything, and a
- *   write that times out is reported as outcome unknown.
+ *   after a 401, which the controller answers before it does anything. A
+ *   write whose request reached a connected socket and then failed (a timeout,
+ *   a cut connection, a redirect) is reported as outcome unknown; one that
+ *   failed before that (the login, the connection itself) as not sent.
  *
  *   NO REDIRECTS. node:http(s) never follows one, and a 3xx is an error here:
  *   the bearer token and the login body must never travel to another origin.
@@ -175,10 +177,27 @@ export function createNdfcClient(config, { now = () => Date.now(), writeEndpoint
   // would be a TLS handshake per call.
   const agent = new lib.Agent({ keepAlive: true, maxSockets: 8, ...tls });
 
-  /** One request. Resolves { status, text }; rejects with an UpstreamError. Never follows a redirect. */
+  /**
+   * One request. Resolves { status, text }; rejects with an UpstreamError whose
+   * `sent` says whether the request had a connected socket when it failed
+   * (false: nothing can have reached the controller). Never follows a redirect.
+   */
   function request(method, pathAndQuery, { headers = {}, body, timeoutMs = config.timeoutMs } = {}) {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolveP, rejectP) => {
       const payload = body === undefined ? null : Buffer.from(JSON.stringify(body), "utf8");
+      // True once this request has a connected (and, for https, handshaken)
+      // socket: from then on its bytes may have reached the controller.
+      let connected = false;
+      let deadline = null;
+      const resolve = (v) => {
+        clearTimeout(deadline);
+        resolveP(v);
+      };
+      const reject = (e) => {
+        clearTimeout(deadline);
+        rejectP(e);
+      };
+      const failure = (status, code, message) => Object.assign(new UpstreamError(status, code, message), { sent: connected });
       const req = lib.request(
         {
           protocol: base.protocol,
@@ -197,7 +216,7 @@ export function createNdfcClient(config, { now = () => Date.now(), writeEndpoint
           const status = res.statusCode || 0;
           if (status >= 300 && status < 400) {
             res.resume();
-            return reject(new UpstreamError(502, "upstream_redirect", "The controller answered with a redirect; this server does not follow redirects with credentials."));
+            return reject(failure(502, "upstream_redirect", "The controller answered with a redirect; this server does not follow redirects with credentials."));
           }
           const chunks = [];
           let size = 0;
@@ -205,23 +224,35 @@ export function createNdfcClient(config, { now = () => Date.now(), writeEndpoint
             size += chunk.length;
             if (size > MAX_BODY_BYTES) {
               req.destroy();
-              return reject(new UpstreamError(502, "upstream_too_large", "The controller's response exceeded the size limit."));
+              return reject(failure(502, "upstream_too_large", "The controller's response exceeded the size limit."));
             }
             chunks.push(chunk);
           });
           res.on("end", () => resolve({ status, text: Buffer.concat(chunks).toString("utf8") }));
-          res.on("error", () => reject(new UpstreamError(502, "upstream_unreachable", "The controller's response was cut off.")));
+          res.on("error", () => reject(failure(502, "upstream_unreachable", "The controller's response was cut off.")));
         }
       );
+      req.on("socket", (socket) => {
+        if (req.reusedSocket) connected = true;
+        else socket.once(base.protocol === "https:" ? "secureConnect" : "connect", () => (connected = true));
+      });
+      // The socket's own timeout starts only once it is connected, so a
+      // controller that does not answer the connection at all would wait for
+      // the operating system (about two minutes). This covers the whole wait
+      // for the answer's first byte, the connection included.
+      deadline = setTimeout(() => req.destroy(new Error("timeout")), timeoutMs);
       req.setTimeout(timeoutMs, () => {
         req.destroy(new Error("timeout"));
       });
+      req.on("response", () => clearTimeout(deadline));
       req.on("error", (e) => {
         if (e instanceof ToolError) return reject(e);
-        if (e?.message === "timeout") return reject(new UpstreamError(504, "upstream_timeout", "The controller did not answer in time."));
-        const tlsFault = /certificate|self.signed|SSL|TLS|altnames/i.test(`${e?.code || ""} ${e?.message || ""}`);
-        if (tlsFault) return reject(new UpstreamError(502, "upstream_tls", "The controller's certificate was not accepted by this server's TLS settings."));
-        return reject(new UpstreamError(502, "upstream_unreachable", "The controller could not be reached."));
+        if (e?.message === "timeout") return reject(failure(504, "upstream_timeout", connected ? "The controller did not answer in time." : "The controller did not accept a connection in time."));
+        // A TLS fault before the handshake finished is this server refusing the
+        // certificate. After it, it is a broken connection like any other.
+        const tlsFault = !connected && /certificate|self.signed|SSL|TLS|altnames/i.test(`${e?.code || ""} ${e?.message || ""}`);
+        if (tlsFault) return reject(failure(502, "upstream_tls", "The controller's certificate was not accepted by this server's TLS settings."));
+        return reject(failure(502, "upstream_unreachable", connected ? "The connection to the controller broke." : "The controller could not be reached."));
       });
       if (payload) req.write(payload);
       req.end();
@@ -319,6 +350,13 @@ export function createNdfcClient(config, { now = () => Date.now(), writeEndpoint
     }
   }
 
+  /** Mark an error as raised before the write could reach the controller. */
+  const notSent = (e) => {
+    if (!(e instanceof ToolError)) return e;
+    // A copy: a login error is shared by every caller that waited for it.
+    return Object.assign(new e.constructor(e.status, e.code, e.message), { notSent: true });
+  };
+
   /**
    * Send ONE write. `endpoint` is the calling tool's declared endpoint
    * ("POST /path/{param}"), and it must be on this client's write list; `path`
@@ -340,17 +378,33 @@ export function createNdfcClient(config, { now = () => Date.now(), writeEndpoint
     let res;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       // A failed login, or a controller that cannot be reached for it, is before the write: nothing was sent.
-      const bearer = await getToken();
+      let bearer;
+      try {
+        bearer = await getToken();
+      } catch (e) {
+        stats.writeFailures += 1;
+        throw notSent(e);
+      }
       try {
         res = await request(method, target, { headers: { Authorization: `Bearer ${bearer}` }, body, timeoutMs: config.writeTimeoutMs });
       } catch (e) {
-        // Once the request has left, a timeout or a cut connection says nothing about what the controller did.
-        if (e instanceof UpstreamError && (e.code === "upstream_timeout" || e.code === "upstream_unreachable" || e.code === "upstream_too_large")) {
-          stats.writeFailures += 1;
-          throw new UpstreamError(504, "write_outcome_unknown", e.code === "upstream_timeout" ? "The controller did not answer the change in time." : "The connection to the controller broke while the change was being sent.");
-        }
         stats.writeFailures += 1;
-        throw e;
+        if (!(e instanceof UpstreamError)) throw e;
+        // No connected socket: the write cannot have reached the controller.
+        if (e.sent === false) throw notSent(e);
+        // Otherwise it may have: a timeout, a cut connection, an answer that
+        // was a redirect or too large say nothing about what the controller did.
+        throw new UpstreamError(
+          504,
+          "write_outcome_unknown",
+          e.code === "upstream_timeout"
+            ? "The controller did not answer the change in time."
+            : e.code === "upstream_redirect"
+              ? "The controller answered the change with a redirect, which this server does not follow."
+              : e.code === "upstream_too_large"
+                ? "The controller's answer to the change exceeded the size limit."
+                : "The connection to the controller broke after the change was sent."
+        );
       }
       // 401 is the controller refusing the session before it acts: one fresh login, one retry.
       if (res.status !== 401 || attempt === 1) break;
@@ -363,7 +417,12 @@ export function createNdfcClient(config, { now = () => Date.now(), writeEndpoint
     try {
       return res.text ? JSON.parse(res.text) : null;
     } catch {
-      return res.text; // several write routes answer one plain sentence
+      // Several write routes answer one plain sentence. A page of markup is
+      // something in front of the controller talking, not the controller.
+      const plain = res.text.trim();
+      if (plain.length <= 400 && !/[<>{}]/.test(plain)) return plain;
+      stats.writeFailures += 1;
+      throw new UpstreamError(502, "upstream_invalid", `The answer to the change was not the controller's (HTTP ${res.status}, not JSON and not a plain sentence).`);
     }
   }
 
@@ -371,7 +430,7 @@ export function createNdfcClient(config, { now = () => Date.now(), writeEndpoint
     get,
     send,
     canWrite: () => allowedWrites.size > 0,
-    stats: () => ({ ...stats, tokenCached: Boolean(token && token.expiresAt - TOKEN_MARGIN_MS > now()) }),
+    stats: () => ({ ...stats, canWrite: allowedWrites.size > 0, tokenCached: Boolean(token && token.expiresAt - TOKEN_MARGIN_MS > now()) }),
     close: () => agent.destroy(),
   };
 }

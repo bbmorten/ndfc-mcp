@@ -50,16 +50,15 @@ import { createNdfcClient, loadNdfcConfig } from "./ndfc.mjs";
 import {
   READ_TOOLS,
   RESULT_BUDGET_BYTES,
-  SERVER_INSTRUCTIONS,
   ToolError,
   WRITE_ENDPOINTS,
-  WRITE_INSTRUCTIONS,
   WRITE_TOOLS,
   accessOf,
   createRateLimiter,
   encodeToolError,
   encodeToolResult,
   endpointsOf,
+  instructionsFor,
   toolError,
   validateArgs,
 } from "./tools.mjs";
@@ -68,7 +67,7 @@ const PROTOCOL_VERSION = "2025-06-18";
 // A later request names the revision it negotiated. These are the revisions
 // whose tools/call shape this server answers; anything else is a 400.
 const KNOWN_PROTOCOL_VERSIONS = new Set(["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]);
-export const SERVER_INFO = { name: "ndfc-mcp", version: "0.3.0" };
+export const SERVER_INFO = { name: "ndfc-mcp", version: "0.3.1" };
 const MAX_BODY_BYTES = 1024 * 1024;
 
 /** Read every setting; returns { config, missing[] }. Nothing has a default that could be wrong. */
@@ -139,7 +138,7 @@ export function createServer(config, deps = {}) {
   const grants = writing && gateway ? deps.grants || createGrantStore({ dataDir: config.access.dataDir, adminEmails: config.access.adminEmails, now: deps.now }) : null;
   /** The caller's role: the ceiling itself in local mode, the person's grant in gateway mode. Never above the ceiling. */
   const roleOf = (user) => (!writing ? "read" : gateway ? grants.roleOf(user.email) : "write");
-  const instructions = writing ? `${SERVER_INSTRUCTIONS}\n${WRITE_INSTRUCTIONS}` : SERVER_INSTRUCTIONS;
+  const instructions = instructionsFor({ writing });
   // Per caller, and across all callers: every call is a request to a network
   // controller that has better things to do than serve a tool loop.
   const perUser = createRateLimiter({ capacity: 30, refillPerSecond: 1, ...(deps.userLimit || {}) });
@@ -148,9 +147,17 @@ export function createServer(config, deps = {}) {
   // An exception that is not a ToolError is a bug here, not an answer: it is
   // logged with its stack and the caller gets a generic tool_failed.
   const onUnexpected = deps.onUnexpected || ((e) => console.error('level=error msg="unexpected tool error"', e));
+  // Changes whose handler is running: what a shutdown has to wait for, and say.
+  const inFlight = new Set();
 
-  const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url, "http://localhost");
+  async function handle(req, res) {
+    let url;
+    try {
+      url = new URL(req.url, "http://localhost");
+    } catch {
+      // "GET //" is not a URL. It is a bad request, never a crashed server.
+      return send(res, 400, { error: "bad request" });
+    }
 
     // Independent of the controller on purpose: a controller or VPN outage
     // must surface as tool errors, not as a restarting container.
@@ -261,15 +268,21 @@ export function createServer(config, deps = {}) {
           const envelope = (result) => ({ jsonrpc: "2.0", id, result });
           const started = Date.now();
           let validated = false;
+          // Set when the handler hands THE write to the controller client. A
+          // failure before that cannot have changed the controller.
+          let writeAttempted = false;
+          let flight = null;
+          // A change is logged with what was asked for — once its arguments
+          // have passed validation, which is what makes them names and
+          // numbers and never something a caller pasted by mistake.
+          const what = () => (changes ? ` access=${need}${validated ? ` args=${JSON.stringify(JSON.stringify(args)).slice(0, 600)}` : ""}` : "");
           const done = (body, outcome) => {
-            // A change is logged with what was asked for — once its arguments
-            // have passed validation, which is what makes them names and
-            // numbers and never something a caller pasted by mistake.
-            const what = changes ? ` access=${need}${validated ? ` args=${JSON.stringify(JSON.stringify(args)).slice(0, 600)}` : ""}` : "";
-            log(`level=info msg="tool call" tool=${tool.name} user=${user ? user.userId : "-"}${what} outcome=${outcome} ms=${Date.now() - started} bytes=${Buffer.byteLength(body)}`);
+            if (flight) inFlight.delete(flight);
+            log(`level=info msg="tool call" tool=${tool.name} user=${user ? user.userId : "-"}${what()} outcome=${outcome} ms=${Date.now() - started} bytes=${Buffer.byteLength(body)}`);
             return send(res, 200, body);
           };
-          const fail = (err) => done(encodeToolError(err, envelope, { log: onUnexpected, write: changes }), err instanceof ToolError ? err.code : "tool_failed");
+          const fail = (err) =>
+            done(encodeToolError(err, envelope, { log: onUnexpected, write: changes, notSent: need === "write" && (!writeAttempted || err?.notSent === true) }), err instanceof ToolError ? err.code : "tool_failed");
 
           // Everything abnormal from here on is a tool RESULT, not an RPC
           // error: the model can read it and adapt.
@@ -287,6 +300,13 @@ export function createServer(config, deps = {}) {
           const problems = validateArgs(tool.inputSchema, args);
           if (problems.length) return fail(toolError(400, "invalid_arguments", problems.join("; ")));
           validated = true;
+          if (changes) {
+            // Before the handler runs, so a change that is at the controller
+            // when this process stops has still left a line.
+            flight = { line: `tool=${tool.name} user=${user.userId}${what()}` };
+            inFlight.add(flight);
+            log(`level=info msg="tool call started" ${flight.line}`);
+          }
           try {
             let value;
             if (need === "admin") value = await tool.handler({ args, user, store: grants });
@@ -297,7 +317,9 @@ export function createServer(config, deps = {}) {
               // whether it is a read or THE write.
               const api = (endpoint, path, { query, body } = {}) => {
                 if (!declared.includes(endpoint)) throw new ToolError(500, "endpoint_mismatch", "The tool tried to call an endpoint it did not declare.");
-                return endpoint.startsWith("GET ") ? ndfc.get(endpoint, path, query) : ndfc.send(endpoint, path, { query, body });
+                if (endpoint.startsWith("GET ")) return ndfc.get(endpoint, path, query);
+                writeAttempted = true;
+                return ndfc.send(endpoint, path, { query, body });
               };
               value = await tool.handler({ args, api, callApi: (path, query) => api(tool.endpoint, path, { query }) });
             }
@@ -318,9 +340,25 @@ export function createServer(config, deps = {}) {
       console.error('level=error msg="request failed"', error);
       return rpcError(res, id, -32603, "internal error");
     }
+  }
+
+  // Nothing a request does may take the process down: a change in flight for
+  // another caller would lose its answer and its log line.
+  const server = http.createServer((req, res) => {
+    handle(req, res).catch((error) => {
+      console.error('level=error msg="request failed"', error);
+      try {
+        if (res.headersSent) res.destroy();
+        else send(res, 500, { error: "internal error" });
+      } catch {
+        res.destroy();
+      }
+    });
   });
 
   server.on("close", () => ndfc.close?.());
+  /** The changes whose handler is still running, as log fragments. */
+  server.changesInFlight = () => [...inFlight].map((f) => f.line);
   return server;
 }
 
@@ -360,12 +398,32 @@ if (isMain) {
         `controller=${config.ndfc.host} tls=${config.ndfc.tlsMode}`
     );
   });
+  // A rejection nobody handled is a bug to log, not a reason to drop a change in flight.
+  process.on("unhandledRejection", (error) => console.error('level=error msg="unhandled rejection"', error));
   // docker stop sends SIGTERM; node as PID 1 ignores it unless told otherwise.
+  let stopping = false;
   for (const sig of ["SIGTERM", "SIGINT"]) {
     process.on(sig, () => {
+      if (stopping) return;
+      stopping = true;
+      const waiting = srv.changesInFlight();
+      // A change that is at the controller is waited for (the compose files give
+      // the container the time), and said: if the wait is cut short, this line
+      // is what the log holds about a change that may have been applied.
+      for (const line of waiting) console.log(`level=warn msg="stopping with a change in flight: its outcome is unknown unless a later line reports it" ${line}`);
       srv.close(() => process.exit(0));
       srv.closeIdleConnections?.();
-      setTimeout(() => process.exit(0), 3000).unref();
+      setTimeout(() => process.exit(0), waiting.length ? config.ndfc.writeTimeoutMs + 15_000 : 3000).unref();
+      if (waiting.length) {
+        // Leave as soon as the last change has been answered and logged.
+        const tick = setInterval(() => {
+          if (srv.changesInFlight().length) return;
+          clearInterval(tick);
+          srv.closeIdleConnections?.();
+          setTimeout(() => process.exit(0), 500).unref();
+        }, 250);
+        tick.unref();
+      }
     });
   }
 }
