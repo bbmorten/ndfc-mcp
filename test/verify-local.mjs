@@ -290,7 +290,10 @@ const BASE_ENV = {
   NDFC_URL: STUB_ORIGIN,
   NDFC_USERNAME: "svc-reader",
   NDFC_PASSWORD: PASSWORD,
-  NDFC_TIMEOUT_MS: "1000",
+  // Generous: a stub on loopback answers in milliseconds, but a cold run on a busy
+  // host (Windows with Defender scanning, 2026-11-16) once took past 1 s on one call.
+  // The timeout case below gets its own server with the 1 s minimum.
+  NDFC_TIMEOUT_MS: "10000",
 };
 
 const servers = [];
@@ -671,9 +674,10 @@ try {
     ["an object where a list belongs", { status: 200, body: { unexpected: true } }, "upstream_invalid", 502, /unexpected shape/],
     ["a controller that does not answer in time", { status: 200, body: [], delayMs: 1500 }, "upstream_timeout", 504, /in time/],
   ];
+  const fast = await start({ NDFC_TIMEOUT_MS: "1000" }); // the shortest timeout configuration allows, for the timeout case
   for (const [label, reply, code, status, message] of errorCases) {
     stub.routes["/lan-fabric/rest/control/fabrics"] = () => reply;
-    const r = await call(S.base, "list_fabrics");
+    const r = await call(code === "upstream_timeout" ? fast.base : S.base, "list_fabrics");
     check(`${label} is an error result (${code}) with guidance and no rows`, r.isError && r.data.error === code && r.data.httpStatus === status && message.test(r.data.message) && /NO data/.test(r.data.guidance) && r.data.fabrics === undefined, JSON.stringify(r.data));
   }
   delete stub.routes["/lan-fabric/rest/control/fabrics"];
@@ -736,7 +740,8 @@ try {
   check("list_alarms returns trimmed rows with ISO times", alarms.data.alarms.length === 2 && alarms.data.alarms[0].raisedAt === "2024-12-06T16:35:46.966Z" && alarms.data.alarms[0].policyValString === undefined && alarms.data.returnedByController === 2);
   check("list_alarms filters by severity and fabric", (await call(S.base, "list_alarms", { severity: "critical" })).data.alarms[0].deviceName === "edge" && (await call(S.base, "list_alarms", { fabricName: "DevNet_Fabric" })).data.alarms.length === 1);
   const hist = await call(S.base, "list_deploy_history", { fabricName: "DevNet_Fabric" });
-  check("list_deploy_history defaults to 50 rows and says more exist", hist.data.deployments.length === 50 && hist.data.totalRows === 120 && hist.data.truncated === true);
+  check("list_deploy_history defaults to 50 rows and says more exist", hist.data?.deployments?.length === 50 && hist.data.totalRows === 120 && hist.data.truncated === true, JSON.stringify(hist.data).slice(0, 400));
+  if (!Array.isArray(hist.data?.deployments)) throw new Error(`list_deploy_history answered without deployments: ${hist.text.slice(0, 400)}`);
   const failedRow = (await call(S.base, "list_deploy_history", { fabricName: "DevNet_Fabric", status: "FAILED" })).data.deployments[0];
   check("list_deploy_history counts commands and failures, without the command text", failedRow?.commandCount === 2 && failedRow?.failedCommandCount === 1 && hist.data.deployments[0].failedCommandCount === 0 && hist.data.deployments[0].configResponseList === undefined);
   {

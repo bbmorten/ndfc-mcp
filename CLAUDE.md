@@ -196,7 +196,12 @@ nineteen prompts clean (223 turns), every deployment settled in ~13 s, the fabri
 empty at the end. Seen on the controller, not in our code: when a VRF's last network leaves a
 switch, the same deployment removes the VRF there (`no vrf context …`), so a later `detach_vrf`
 is refused *is already in detached state* and `deploy_vrf` finds nothing pending.
-`MCP_TEST_VRF`/`MCP_TEST_NET` are gone. **Still not pushed**: the remote's main is 0.2.0.
+`MCP_TEST_VRF`/`MCP_TEST_NET` are gone. Pushed (`b4a46d1`).
+
+On Windows (2026-11-16, Node 22.15) the harness crashed once in six runs at the first
+`list_deploy_history` check: one call to the stub took past the harness's 1 s controller
+timeout. The harness now gives the stub 10 s (the timeout case keeps its own 1 s server), and
+that check prints what came back instead of crashing.
 
 ## State (2026-11-14, evening): 0.3.1, the review's fixes
 
