@@ -265,9 +265,10 @@ people's own tool servers off — a call then answers that own tool servers are 
 - *"Which alarms are raised right now, grouped by switch?"*
 - *"What was the last thing deployed to spine1, and did it succeed?"*
 
-[PROMPTS.md](PROMPTS.md) has thirteen longer ones that combine several tools — rebuilding the
-topology as a diagram, triaging alarms, investigating out-of-sync switches, auditing the underlay
-addressing — with what the first four found on the sandbox.
+[PROMPTS.md](PROMPTS.md) has longer ones that combine several tools, each with what it found on
+the sandbox: thirteen that only read (rebuilding the topology as a diagram, triaging alarms,
+investigating out-of-sync switches, auditing the underlay addressing, …) and nineteen that need
+write access, in six scenarios that build, check, take off and delete VRFs and networks.
 
 ## What it will and will not tell you
 
@@ -517,8 +518,13 @@ not verified:** a real gateway.
 On Windows 11 with Docker Desktop (same day): the 175 checks pass, and `.\setup` built and
 started the server without the sidecar, saw it healthy, and reached it over HTTP and over stdio
 through `docker compose exec`. With the sidecar, the `vpn` container reached the sandbox gateway,
-which refused the login of a reservation that had ended. So **a tunnel that comes up, and a real
-controller behind it, have not been seen from Windows.**
+which refused the login of a reservation that had ended.
+
+On 2026-11-17, with a new reservation, the tunnel came up on Windows too: `.\setup` with the
+sidecar, the CA pinned and write access; both containers healthy, `/healthz` showing 0.3.1 and
+26 tools, and the stdio bridge from PowerShell answering from the controller (12.2.2.241, both
+fabrics). The harness passed 9 runs of 9 there. **Not yet run on Windows:** a real `claude` CLI
+and aimo.
 
 `spec/` holds Cisco's OpenAPI document for NDFC 12.2.2 (Apache 2.0), which the tests hold the
 tools to.

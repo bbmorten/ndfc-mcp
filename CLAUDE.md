@@ -32,6 +32,7 @@ VPN the server has to open itself — which a cluster deployment could not do.
 | `defaults.env` | `setup`'s defaults — **committed with the lab's credentials, on the owner's decision** (see Working rules) |
 | `test/verify-local.mjs` | the offline harness (stub controller on loopback) |
 | `test/live-check.mjs` | every read tool against a real controller; `--write` and `--deploy` change it and put it back |
+| `PROMPTS.md` | longer prompts, all run on the lab: thirteen that read, nineteen that write (from the platform's KB articles 23 and 24) |
 | `spec/nd-fabric-controller-lan-1222.json.gz` | Cisco's OpenAPI document for NDFC 12.2.2 (Apache 2.0); data for the harness |
 
 ## Commands
