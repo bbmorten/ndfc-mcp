@@ -201,7 +201,18 @@ is refused *is already in detached state* and `deploy_vrf` finds nothing pending
 On Windows (2026-11-16, Node 22.15) the harness crashed once in six runs at the first
 `list_deploy_history` check: one call to the stub took past the harness's 1 s controller
 timeout. The harness now gives the stub 10 s (the timeout case keeps its own 1 s server), and
-that check prints what came back instead of crashing.
+that check prints what came back instead of crashing. At `b60255e` it passed 9 runs of 9 there.
+
+**The Windows tunnel is verified** (2026-11-17, Windows 11, Docker Desktop 29.9, `2c71ee8`):
+the owner ran `.\setup` (VPN sidecar, TLS pin, write access). The sidecar logged in to the
+sandbox gateway (group `SSLClient`, DTLS + LZS), `tun0` got `192.168.254.x/32`, both containers
+were healthy, `/healthz` reported 0.3.1, 26 tools, `controllerTls: pin`, one controller login and
+`canWrite: true`. The stdio bridge driven from PowerShell announced `list_changed`, listed 26
+tools, and answered `get_controller_info` (12.2.2.241) and `list_fabrics`. No write was sent. The
+sidecar rode out one dead-peer detection, reconnecting with the same address. Its `.env` had
+kept the previous reservation's VPN password over `defaults.env`'s new one (`.env` wins in
+`setup`), which is why a new reservation needs either `.env`'s `VPN_*` lines removed or
+re-entered. Still not run there: a real `claude` CLI (not installed) and aimo.
 
 ## State (2026-11-14, evening): 0.3.1, the review's fixes
 
@@ -363,8 +374,8 @@ ended. No tunnel came up on Windows. That run is why `setup` now says, when `up`
 whether Docker is not answering or the tunnel did not come up, shows the sidecar's last lines,
 and stops it instead of leaving it to retry a refused login.
 
-**Not verified:** on Windows, a tunnel that comes up (and so a real controller, and `setup`'s
-CA pin), and a real `claude` CLI; a gateway other than the sandbox's (a second
+**Not verified:** on Windows, a real `claude` CLI (the tunnel, a real controller and `setup`'s
+CA pin were verified on 2026-11-17, above); a gateway other than the sandbox's (a second
 factor, a private gateway certificate, another protocol); Claude Desktop.
 
 Closed since this section was written: the aimo VS Code extension called the server later the
