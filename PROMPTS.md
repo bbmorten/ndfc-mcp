@@ -65,14 +65,14 @@ which had no alarm on that page.*
 
 ### 3. Investigate out-of-sync switches
 
-> Find out which switches in DevNet_Fabric, if any, are out of sync with the controller. If none are, say so and stop here. Otherwise, then
-> for each: its role, its last five configuration deployments (what was deployed to, when, by
-> whom, outcome, and whether any command failed), and whether its interfaces also show an
-> out-of-sync state and which ones. Compare with one switch that IS in sync. Tell me what the
-> out-of-sync switches have in common, what the data suggests changed, and what the tools cannot
-> tell me (for example the pending configuration difference itself). End with a short, ordered
-> checklist of what an engineer should do in the NDFC UI next. Do not propose that you make any
-> change.
+> Find out which switches in DevNet_Fabric, if any, are out of sync with the controller. If none
+> are, say so and stop here. Otherwise, for each: its role, its last five configuration deployments
+> (what was deployed to, when, by whom, outcome, and whether any command failed), and whether its
+> interfaces also show an out-of-sync state and which ones. Compare with one switch that IS in
+> sync. Tell me what the out-of-sync switches have in common, what the data suggests changed, and
+> what the tools cannot tell me (for example the pending configuration difference itself). End
+> with a short, ordered checklist of what an engineer should do in the NDFC UI next. Do not
+> propose that you make any change.
 
 *20 turns, 85 s. Three switches (both leaves and the border) were out of sync, every one of their
 64 Ethernet ports with them, while loopbacks and management were in sync and the spines were
@@ -98,9 +98,10 @@ link to the external router had MTU 9216 on one end and 1500 on the other.*
 > Give me a morning brief for every fabric on this controller, one section per fabric: how many
 > switches by role, how many are healthy and how many in sync, software versions in use and
 > whether they are all the same, the raised alarms grouped by severity and by switch, and any
-> configuration deployment that failed (use list_deploy_history with status FAILED; if there is none, say so). Put the three things that most need attention at the top,
-> each with the switch name and the evidence. If the alarm list looks like a single page, say so
-> instead of treating it as complete.
+> configuration deployment that failed (use list_deploy_history with status FAILED; if there is
+> none, say so). Put the three things that most need attention at the top, each with the switch
+> name and the evidence. If the alarm list looks like a single page, say so instead of treating it
+> as complete.
 
 *23 turns, 52 s. Its top three: three switches out of sync with no failed deployment to explain
 it, an alarm list that was one page of 50 (all from spine1) while every switch showed Minor
@@ -111,11 +112,11 @@ was about two years old.*
 
 > Tomorrow I will add a new tenant to DevNet_Fabric: one VRF and two networks. Check whether the
 > fabric is in a state to take that change, and tell me what I need to know first. Look at:
-> whether every switch is reachable and in sync, and which are not (if none, say so); raised alarms on the leaves
-> and the border; the VRFs and networks that already exist, with their VNIs and VLANs; and the
-> fabric's settings for VRF and network VLAN ranges, VNI ranges and the VRF and network
-> templates. Give me a go / no-go with reasons, the ranges my new VNIs and VLANs must come from,
-> and the values already taken. Do not create anything.
+> whether every switch is reachable and in sync, and which are not (if none, say so); raised
+> alarms on the leaves and the border; the VRFs and networks that already exist, with their VNIs
+> and VLANs; and the fabric's settings for VRF and network VLAN ranges, VNI ranges and the VRF and
+> network templates. Give me a go / no-go with reasons, the ranges my new VNIs and VLANs must come
+> from, and the values already taken. Do not create anything.
 
 *19 turns, 49 s. No-go: the three switches that would get the tenant were out of sync, and it
 could not see any alarm for them because the one page of alarms was all spine1. It gave the
@@ -235,7 +236,7 @@ documentation ranges (192.0.2.0/24, 198.51.100.0/24), which no real network uses
 `Ethernet1/16`.
 
 The prompts say "Use the ndfc tool server". Replace that with the name your client gives this
-server (in the lab's aimo it is `own_ndfc`); the wording of the rest of each prompt stays.
+server (the server's slug in this environment is `own_ndfc`; the name your client shows may differ); the wording of the rest of each prompt stays.
 
 ### What makes a change prompt work here
 
@@ -272,6 +273,10 @@ Touch no other object. If a step fails, stop and say what is already on the cont
 *15 turns, 70 s. Both created (VNI 50000 and 30000), four attachments `PENDING`, then each deploy
 settled in 13 s with both leaves `DEPLOYED` (VLAN 2000 and 2300).*
 
+*Run again on 2026-11-17: as written, except that 1a did not re-read list_switches first (both
+leaves had read `ok` earlier in that session). The VRF and network were created (VNI 50001 and
+30000, see 1d), four attachments went `PENDING`, and both deploys reached `DEPLOYED` in 13 s.*
+
 #### 1b. Check
 
 ```text
@@ -283,6 +288,9 @@ Use the ndfc tool server, fabric DevNet_Fabric. Check the tenant KB_T1_VRF / KB_
 ```
 
 *7 turns, 22 s. Both `DEPLOYED` on both leaves, nothing pending.*
+
+*Run again on 2026-11-17: steps 1, 2 and 4 as written. Step 3 (list_deploy_history, limit 5, for
+each leaf) was not run, so the history was not read per switch.*
 
 #### 1c. Take it off the switches
 
@@ -297,6 +305,9 @@ Use the ndfc tool server, fabric DevNet_Fabric. Take the tenant KB_T1_VRF / KB_T
 pending: when a VRF's last network leaves a switch, the controller removes the VRF there in the
 same deployment. The answer pointed out the mismatch instead of hiding it.*
 
+*Run again on 2026-11-17: as written. The VRF's deploy reported nothing pending, as the note above
+says.*
+
 #### 1d. Delete
 
 ```text
@@ -307,6 +318,11 @@ Use the ndfc tool server, fabric DevNet_Fabric. Finish removing the tenant.
 ```
 
 *8 turns, 17 s. Nothing attached, both deleted, neither listed.*
+
+*Run again on 2026-11-17 (0.3.1, write access, DevNet_Fabric), step by step by hand, so no turn
+counts. Every step as written. The VRF got VNI 50001, not 50000, because `KB_APP_VRF` held 50000
+at the time. The VRF's deploy after the detach reported nothing pending, as the note above
+says. Delete succeeded with nothing attached.*
 
 ### Scenario 2: A layer-2 segment across three switches
 
@@ -326,6 +342,9 @@ Touch no other object.
 
 *10 turns, 41 s. `DEPLOYED` on all three switches.*
 
+*Run again on 2026-11-17: 2a did not re-read list_switches before the change (both leaves had
+read `ok` earlier in that session). Otherwise as written.*
+
 #### 2b. Check
 
 ```text
@@ -333,6 +352,9 @@ Use the ndfc tool server, fabric DevNet_Fabric. Without changing anything, read 
 ```
 
 *4 turns, 12 s. On all three, VNI 30000, VLAN 2350, a port on each leaf and none on the border.*
+
+*Run again on 2026-11-17: 2b read the attachments but not list_networks, so the VNI came from the
+attachment read only.*
 
 #### 2c. Take it off the switches
 
@@ -348,7 +370,10 @@ Use the ndfc tool server, fabric DevNet_Fabric. Detach KB_L2_STRETCH from leaf1,
 Use the ndfc tool server, fabric DevNet_Fabric. Read the attachments of KB_L2_STRETCH. If any switch still shows it attached or PENDING, stop and report. Otherwise delete it, and confirm with list_networks that it is gone.
 ```
 
-*5 turns, 12 s. Deleted. On the first try after the detach the controller refused with "Network deployed, detach and delete" while the network still read `DEPLOYED`. About 30 s later the attachments read `NA` and the same delete succeeded: wait and retry once before reporting a refusal.*
+*5 turns, 12 s. Deleted. On the first try after the detach the controller refused with "Network deployed, detach and delete" while the network still read `DEPLOYED`. About 30 s later the attachments read `NA` and the same delete succeeded: wait and retry once before reporting a refusal.
+
+*Run again on 2026-11-17: 2a to 2c, every switch `DEPLOYED` on VLAN 2350. The 2d
+delete was refused once, as above, then succeeded after a 30 s wait.*
 
 ### Scenario 3: A three-tier application in one VRF
 
@@ -401,6 +426,12 @@ Use the ndfc tool server, fabric DevNet_Fabric. Read the attachments of KB_APP_V
 
 *12 turns, 19 s. All four deleted; nothing named `KB_APP_` left.*
 
+*Run again on 2026-11-17. A stale `KB_APP_VRF` from an earlier run (no attachments, no networks)
+was on the controller before the run began. It was deleted, with the owner's agreement, so the
+scenario started clean. 3a to 3d as written, in order, with the state read at the start of 3a and again before 3d. In 3c leaf1's VRF detach was refused as "already in
+detached state" and leaf2's was accepted; the VRF's deploy then reported nothing pending, and
+every attachment read `NA`.*
+
 ### Scenario 4: Move a server from one leaf to another
 
 A server moves from leaf1 to leaf2 while its network stays on leaf1's other port.
@@ -448,6 +479,10 @@ Use the ndfc tool server, fabric DevNet_Fabric. Read the attachments of KB_MOVE_
 
 *8 turns, 14 s. Both deleted.*
 
+*Run again on 2026-11-17: 4a did not re-read list_switches before the change (both leaves had read
+`ok` earlier in that session). 4b to 4d as written. In 4b the controller read back Ethernet1/16 on
+leaf1 and Ethernet1/15 on leaf2, both on VLAN 2300.*
+
 ### Scenario 5: What is refused
 
 Six changes that must not happen, tried one after another. Nothing is attached or deployed, so
@@ -474,7 +509,12 @@ Deploy nothing and touch no other object.
 network; a duplicate VRF, both HTTP 400). The server refused three before sending anything
 (`invalid_arguments`: the reserved name `management`, a gateway in the VRF `NA`, and taking a
 port out where the network is not attached). For (d) the model chose a gateway itself, because
-the prompt did not give one.*
+the prompt did not give one.
+
+*Run again on 2026-11-17: all six refused, nothing changed. Step (e) first failed on argument
+type, because the port list was sent as an array; the string form `Ethernet1/12` gave the
+refusal the prompt describes. Step (d) was given its gateway, so its refusal is the `NA` message
+alone.*
 
 ### Scenario 6: Bring the whole fabric back in sync
 
@@ -505,4 +545,9 @@ Use the ndfc tool server, fabric DevNet_Fabric. Without changing anything: read 
 ```
 
 *4 turns, 18 s. All five In-Sync, no failure in the 30 newest deployment rows, two warnings on
-leaf2.*
+leaf2.
+
+*Run again on 2026-11-17: precheck found all five `ok` and `In-Sync`. Recalculate answered "Config
+save is completed" and the deploy "Configuration deployment completed.", run once with no
+timeout. All five stayed `In-Sync`. The newest rows I read were scenario 3's teardown on leaf1 and
+leaf2, not this deploy, and 6b was not run this session.*
