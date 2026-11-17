@@ -65,7 +65,7 @@ which had no alarm on that page.*
 
 ### 3. Investigate out-of-sync switches
 
-> Some switches in DevNet_Fabric are out of sync with the controller. Find out which ones, then
+> Find out which switches in DevNet_Fabric, if any, are out of sync with the controller. If none are, say so and stop here. Otherwise, then
 > for each: its role, its last five configuration deployments (what was deployed to, when, by
 > whom, outcome, and whether any command failed), and whether its interfaces also show an
 > out-of-sync state and which ones. Compare with one switch that IS in sync. Tell me what the
@@ -98,7 +98,7 @@ link to the external router had MTU 9216 on one end and 1500 on the other.*
 > Give me a morning brief for every fabric on this controller, one section per fabric: how many
 > switches by role, how many are healthy and how many in sync, software versions in use and
 > whether they are all the same, the raised alarms grouped by severity and by switch, and any
-> configuration deployment that failed. Put the three things that most need attention at the top,
+> configuration deployment that failed (use list_deploy_history with status FAILED; if there is none, say so). Put the three things that most need attention at the top,
 > each with the switch name and the evidence. If the alarm list looks like a single page, say so
 > instead of treating it as complete.
 
@@ -111,7 +111,7 @@ was about two years old.*
 
 > Tomorrow I will add a new tenant to DevNet_Fabric: one VRF and two networks. Check whether the
 > fabric is in a state to take that change, and tell me what I need to know first. Look at:
-> whether every switch is reachable and in sync, and which are not; raised alarms on the leaves
+> whether every switch is reachable and in sync, and which are not (if none, say so); raised alarms on the leaves
 > and the border; the VRFs and networks that already exist, with their VNIs and VLANs; and the
 > fabric's settings for VRF and network VLAN ranges, VNI ranges and the VRF and network
 > templates. Give me a go / no-go with reasons, the ranges my new VNIs and VLANs must come from,
@@ -234,6 +234,9 @@ documentation ranges (192.0.2.0/24, 198.51.100.0/24), which no real network uses
 `leaf1` and `leaf2` are leaves, `leaf3` is the border, and the ports used are `Ethernet1/12` to
 `Ethernet1/16`.
 
+The prompts say "Use the ndfc tool server". Replace that with the name your client gives this
+server (in the lab's aimo it is `own_ndfc`); the wording of the rest of each prompt stays.
+
 ### What makes a change prompt work here
 
 - **Name every object and every switch.** The model changes only what you name, and the server
@@ -246,6 +249,8 @@ documentation ranges (192.0.2.0/24, 198.51.100.0/24), which no real network uses
   failed check into a report instead of a half-built tenant.
 - **Ask for what the controller answered.** The answer then quotes the controller, not the
   model's idea of what happened.
+- **Give port lists as one string.** `switchPorts` and `detachSwitchPorts` take comma-separated
+  names with no spaces, for example `Ethernet1/15,Ethernet1/16`. A JSON array is refused.
 
 ### Scenario 1: A tenant on two leaves
 
@@ -285,7 +290,7 @@ Use the ndfc tool server, fabric DevNet_Fabric. Check the tenant KB_T1_VRF / KB_
 Use the ndfc tool server, fabric DevNet_Fabric. Take the tenant KB_T1_VRF / KB_T1_WEB off the switches.
 1. Detach KB_T1_WEB from leaf1 and from leaf2, and deploy KB_T1_WEB.
 2. Detach KB_T1_VRF from leaf1 and from leaf2, and deploy KB_T1_VRF.
-3. Report what the controller answered to each change. Do not delete anything yet and touch no other object.
+3. Report what the controller answered to each change. If the VRF's deploy finds nothing pending, say so: the controller removes a VRF from a switch when its last network leaves that switch. Do not delete anything yet and touch no other object.
 ```
 
 *18 turns, 74 s. Both off both leaves, which stayed In-Sync. The VRF's deploy found nothing
@@ -343,7 +348,7 @@ Use the ndfc tool server, fabric DevNet_Fabric. Detach KB_L2_STRETCH from leaf1,
 Use the ndfc tool server, fabric DevNet_Fabric. Read the attachments of KB_L2_STRETCH. If any switch still shows it attached or PENDING, stop and report. Otherwise delete it, and confirm with list_networks that it is gone.
 ```
 
-*5 turns, 12 s. Deleted.*
+*5 turns, 12 s. Deleted. On the first try after the detach the controller refused with "Network deployed, detach and delete" while the network still read `DEPLOYED`. About 30 s later the attachments read `NA` and the same delete succeeded: wait and retry once before reporting a refusal.*
 
 ### Scenario 3: A three-tier application in one VRF
 
@@ -380,7 +385,7 @@ Use the ndfc tool server, fabric DevNet_Fabric. Without changing anything, repor
 ```text
 Use the ndfc tool server, fabric DevNet_Fabric. Take the application off the switches, one network at a time.
 1. For KB_APP_WEB, then KB_APP_MID, then KB_APP_DB: detach it from every switch it is attached to, and deploy it before you go on to the next one.
-2. Then detach KB_APP_VRF from leaf1 and leaf2, and deploy it.
+2. Then detach KB_APP_VRF from leaf1 and leaf2, and deploy it. If the controller refuses the leaf1 detach as "already in detached state", that is expected after step 1 (the last network's deployment removes the VRF there); continue with leaf2.
 3. Report what the controller answered to each change.
 Do not delete anything yet and touch nothing else.
 ```
@@ -420,7 +425,7 @@ Use the ndfc tool server, fabric DevNet_Fabric. Set up a server's network on lea
 Use the ndfc tool server, fabric DevNet_Fabric. Move the server on Ethernet1/15 from leaf1 to leaf2, keeping KB_MOVE_NET on leaf1's Ethernet1/16.
 1. Read list_network_attachments for KB_MOVE_NET and note its ports on each switch.
 2. Attach KB_MOVE_VRF to leaf2, and KB_MOVE_NET to leaf2 on Ethernet1/15.
-3. Take only Ethernet1/15 out of KB_MOVE_NET on leaf1.
+3. Call detach_network for KB_MOVE_NET on leaf1 with detachSwitchPorts ["Ethernet1/15"], so the network stays attached to leaf1 on Ethernet1/16.
 4. Deploy KB_MOVE_VRF and KB_MOVE_NET.
 5. Report the ports on each switch before this step and as the controller has them now.
 ```
@@ -430,7 +435,7 @@ Use the ndfc tool server, fabric DevNet_Fabric. Move the server on Ethernet1/15 
 #### 4c. Take it off the switches
 
 ```text
-Use the ndfc tool server, fabric DevNet_Fabric. Detach KB_MOVE_NET from every switch it is attached to and deploy it; then detach KB_MOVE_VRF from every switch and deploy it. Report what the controller answered. Do not delete anything yet.
+Use the ndfc tool server, fabric DevNet_Fabric. Detach KB_MOVE_NET from every switch it is attached to and deploy it; then detach KB_MOVE_VRF from every switch and deploy it. Report what the controller answered. If the VRF's deploy finds nothing pending, say so: the controller removes a VRF from a switch when its last network leaves that switch. Do not delete anything yet.
 ```
 
 *17 turns, 59 s. Off every switch. The VRF's deploy had nothing to do, for the reason in 1c.*
@@ -457,7 +462,7 @@ Use the ndfc tool server, fabric DevNet_Fabric. Show me what is refused, without
    a. attach KB_GUARD_VRF to the switch spine1;
    b. delete KB_GUARD_VRF while KB_GUARD_NET still exists;
    c. create a VRF named management;
-   d. create a network named KB_GUARD_BAD in the VRF NA, with a gateway;
+   d. create a network named KB_GUARD_BAD in the VRF NA, gateway 192.0.2.200/26;
    e. take Ethernet1/12 out of KB_GUARD_NET on leaf1, where the network is not attached;
    f. create KB_GUARD_VRF a second time.
 3. Delete KB_GUARD_NET and KB_GUARD_VRF, and confirm with list_vrfs and list_networks that neither is left.
@@ -491,7 +496,7 @@ Create, attach, detach or delete nothing.
 and deploy ("Configuration deployment completed.") had nothing to push. The first time, right
 after the switches were rebuilt with their day-0 configuration, four were `Pending` and the
 deploy ran past `NDFC_WRITE_TIMEOUT_MS`: `write_outcome_unknown`, then all `In-Sync` two minutes
-later on their own.*
+later on their own. A later run, with the switches already `In-Sync`, had nothing to push and finished without the timeout.*
 
 #### 6b. Check
 
